@@ -1,0 +1,47 @@
+# vim: filetype=dockerfile
+
+ARG FLAVOR=amd64
+
+ARG ROCMVERSION=6.1.2
+ARG JETPACK5VERSION=r35.4.1
+ARG JETPACK6VERSION=r36.2.0
+ARG CMAKEVERSION=3.31.2
+
+FROM --platform=linux/amd64 rocm/dev-centos-7:${ROCMVERSION}-complete AS base-amd64
+RUN sed -i -e 's/mirror.centos.org/vault.centos.org/g' -e 's/^#.*baseurl=http/baseurl=http/g' -e 's/^mirrorlist=http/#mirrorlist=http/g' /etc/yum.repos.d/*.repo \
+    && yum install -y yum-utils devtoolset-10-gcc devtoolset-10-gcc-c++ \
+    && yum-config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel7/x86_64/cuda-rhel7.repo \
+    && curl -s -L https://github.com/ccache/ccache/releases/download/v4.10.2/ccache-4.10.2-linux-x86_64.tar.xz | tar -Jx -C /usr/local/bin --strip-components 1
+ENV PATH=/opt/rh/devtoolset-10/root/usr/bin:/opt/rh/devtoolset-11/root/usr/bin:$PATH
+
+FROM base-${TARGETARCH} AS base
+ARG CMAKEVERSION
+RUN curl -fsSL https://github.com/Kitware/CMake/releases/download/v${CMAKEVERSION}/cmake-${CMAKEVERSION}-linux-$(uname -m).tar.gz | tar xz -C /usr/local --strip-components 1
+COPY CMakeLists.txt CMakePresets.json .
+COPY ml/backend/ggml/ggml ml/backend/ggml/ggml
+ENV LDFLAGS=-s
+
+FROM base AS cuda-11
+ARG CUDA11VERSION=11.3
+RUN yum install -y cuda-toolkit-${CUDA11VERSION//./-}
+ENV PATH=/usr/local/cuda-11/bin:$PATH
+RUN --mount=type=cache,target=/root/.ccache \
+    cmake --preset 'CUDA 11 35 and 75' \
+        && cmake --build --parallel --preset 'CUDA 11 35 and 75' \
+        && cmake --install build --component CUDA --strip --parallel 8
+
+FROM base AS build
+ARG GOVERSION=1.23.4
+RUN curl -fsSL https://golang.org/dl/go${GOVERSION}.linux-$(case $(uname -m) in x86_64) echo amd64 ;; aarch64) echo arm64 ;; esac).tar.gz | tar xz -C /usr/local
+ENV PATH=/usr/local/go/bin:$PATH
+WORKDIR /go/src/github.com/ollama/ollama
+COPY . .
+ARG GOFLAGS="'-ldflags=-w -s'"
+ENV CGO_ENABLED=1
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    go build -trimpath -buildmode=pie -o /bin/ollama .
+
+FROM --platform=linux/amd64 ubuntu:22.04 AS amd64
+COPY --from=cuda-11 dist/lib/ollama/cuda_v11 /lib/ollama/cuda_v11
+COPY --from=build /bin/ollama /bin/ollama
+
