@@ -618,7 +618,7 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 
 	timeout := 10 * time.Second
 	if runner.loading {
-		timeout = 2 * time.Minute // Initial load can take a long time for big models on slow systems...
+		timeout = 5 * time.Minute // Initial load can take a long time for big models on slow systems...
 	}
 
 	if runner.Options == nil {
