@@ -33,12 +33,20 @@ struct llama_mmap_prefetcher::impl {
     const std::vector<std::pair<size_t, size_t>> * regions = nullptr;
 
     void run() {
+        LLAMA_LOG_DEBUG("prefetch thread started, %zu regions, ahead_count=%zu\n",
+                        regions->size(), ahead_count);
         size_t prefetch_idx = 0;
+        size_t total_bytes_prefetched = 0;
         while (!should_stop.load(std::memory_order_relaxed)) {
             size_t target = main_idx.load(std::memory_order_relaxed) + ahead_count;
             while (prefetch_idx < target && prefetch_idx < regions->size()) {
                 auto [off, len] = (*regions)[prefetch_idx];
-                posix_madvise(static_cast<char *>(addr) + off, len, POSIX_MADV_WILLNEED);
+                int rc = posix_madvise(static_cast<char *>(addr) + off, len, POSIX_MADV_WILLNEED);
+                if (rc != 0) {
+                    LLAMA_LOG_WARN("prefetch madvise(WILLNEED) failed at offset %zu, len %zu: %s\n",
+                                   off, len, strerror(rc));
+                }
+                total_bytes_prefetched += len;
                 prefetch_idx++;
             }
             std::unique_lock<std::mutex> lock(mtx);
@@ -47,6 +55,8 @@ struct llama_mmap_prefetcher::impl {
                        main_idx.load(std::memory_order_relaxed) + ahead_count > prefetch_idx;
             });
         }
+        LLAMA_LOG_DEBUG("prefetch thread finished, prefetched %zu regions (%.1f MB)\n",
+                        prefetch_idx, (double)total_bytes_prefetched / (1024.0 * 1024.0));
     }
 };
 
@@ -103,14 +113,20 @@ struct llama_direct_reader::impl {
         fd = open(path, O_RDONLY | O_DIRECT);
         if (fd >= 0) {
             direct = true;
+            LLAMA_LOG_INFO("O_DIRECT enabled for model file (bypassing page cache)\n");
         } else {
+            int saved_errno = errno;
             fd = open(path, O_RDONLY);
             if (fd < 0) {
                 throw std::runtime_error(format("failed to open %s: %s", path, strerror(errno)));
             }
             direct = false;
+            LLAMA_LOG_WARN("O_DIRECT not available (%s), using buffered I/O with fadvise\n",
+                           strerror(saved_errno));
         }
-        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL) != 0) {
+            LLAMA_LOG_DEBUG("posix_fadvise(SEQUENTIAL) failed: %s\n", strerror(errno));
+        }
     }
 
     ~impl() {
@@ -323,7 +339,10 @@ struct llama_uring_reader::impl {
         }
 
         int ret = llama_io_uring_enter(ring_fd, 0, 1, IORING_ENTER_GETEVENTS);
-        if (ret < 0) { return {0, -1}; }
+        if (ret < 0) {
+            LLAMA_LOG_WARN("io_uring_enter wait failed: %s\n", strerror(errno));
+            return {0, -1};
+        }
 
         uint32_t head = *cq_head_ptr();
         uint32_t tail_val = __atomic_load_n(cq_tail_ptr(), __ATOMIC_ACQUIRE);
@@ -334,6 +353,11 @@ struct llama_uring_reader::impl {
 
         uint64_t token = cqe->user_data;
         ssize_t result = cqe->res;
+
+        if (result < 0) {
+            LLAMA_LOG_WARN("io_uring read completion error: token=%llu, error=%s\n",
+                           (unsigned long long)token, strerror(-(int)result));
+        }
 
         __atomic_store_n(cq_head_ptr(), head + 1, __ATOMIC_RELEASE);
         n_pending.fetch_sub(1, std::memory_order_relaxed);

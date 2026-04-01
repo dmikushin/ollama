@@ -1037,6 +1037,13 @@ bool llama_model_loader::load_all_data(
         }
         // Sort by offset for sequential prefetch
         std::sort(prefetch_regions.begin(), prefetch_regions.end());
+
+        size_t total_prefetch_bytes = 0;
+        for (const auto & r : prefetch_regions) { total_prefetch_bytes += r.second; }
+        LLAMA_LOG_INFO("%s: starting mmap prefetch thread for %zu tensor regions (%.1f MB)\n",
+                       __func__, prefetch_regions.size(),
+                       (double)total_prefetch_bytes / (1024.0 * 1024.0));
+
         prefetcher.start(mappings.at(0)->addr(), prefetch_regions);
     }
 
@@ -1053,8 +1060,10 @@ bool llama_model_loader::load_all_data(
             if (direct_reader->is_direct()) {
                 LLAMA_LOG_INFO("%s: using O_DIRECT for model loading (bypassing page cache)\n", __func__);
             }
+        } catch (const std::exception & e) {
+            LLAMA_LOG_DEBUG("%s: O_DIRECT reader init failed: %s\n", __func__, e.what());
         } catch (...) {
-            // O_DIRECT not available, will use regular reads
+            LLAMA_LOG_DEBUG("%s: O_DIRECT reader init failed (unknown error)\n", __func__);
         }
     }
 
@@ -1064,8 +1073,20 @@ bool llama_model_loader::load_all_data(
     if (upload_backend && !use_mmap && !files.empty()) {
         if (llama_uring_reader::supported()) {
             uring_reader = std::make_unique<llama_uring_reader>(files.at(0)->file_id(), 32);
+            LLAMA_LOG_INFO("%s: using io_uring for async GPU upload reads (queue_depth=32)\n", __func__);
+        } else {
+            LLAMA_LOG_DEBUG("%s: io_uring not available, using blocking reads for GPU uploads\n", __func__);
         }
     }
+
+    // Log loading strategy summary
+    LLAMA_LOG_INFO("%s: model loading strategy: mmap=%s, prefetch=%s, O_DIRECT=%s, io_uring=%s, async_gpu=%s\n",
+                   __func__,
+                   use_mmap ? "yes" : "no",
+                   (use_mmap && !prefetch_regions.empty()) ? "yes" : "no",
+                   (direct_reader && direct_reader->is_direct()) ? "yes" : "no",
+                   uring_reader ? "yes" : "no",
+                   upload_backend ? "yes" : "no");
 
     size_t prefetch_idx = 0;
 
@@ -1145,13 +1166,16 @@ bool llama_model_loader::load_all_data(
                             uint64_t token = uring_reader->submit_read(
                                 host_ptrs[buffer_idx], read_iteration, weight->offs + bytes_read);
                             if (token == 0) {
-                                // io_uring submit failed, fall back to sync read
+                                LLAMA_LOG_DEBUG("%s: io_uring submit failed for tensor '%s', falling back to sync read\n",
+                                                __func__, ggml_get_name(cur));
                                 file->seek(weight->offs + bytes_read, SEEK_SET);
                                 file->read_raw(host_ptrs[buffer_idx], read_iteration);
                             } else {
                                 auto [_, n] = uring_reader->wait_one();
                                 if (n < 0 || (size_t)n < read_iteration) {
-                                    // Short/failed read, fall back to sync
+                                    LLAMA_LOG_WARN("%s: io_uring short/failed read for tensor '%s' "
+                                                   "(got %zd, expected %zu), falling back to sync\n",
+                                                   __func__, ggml_get_name(cur), n, read_iteration);
                                     file->seek(weight->offs + bytes_read, SEEK_SET);
                                     file->read_raw(host_ptrs[buffer_idx], read_iteration);
                                 }

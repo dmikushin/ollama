@@ -506,6 +506,13 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
 	// chunk of tensors in offset order. This limits NFS connections and
 	// gives each FD a sequential access pattern for effective readahead.
 	const nWorkers = 8
+	actualWorkers := min(nWorkers, len(tensors))
+	slog.Info("loading model tensors",
+		"tensors", len(tensors),
+		"workers", actualWorkers,
+		"total_bytes", totalBytes,
+		"buffer_size", 4*format.MebiByte,
+	)
 	g, ctx := errgroup.WithContext(ctx)
 	chunkSize := (len(tensors) + nWorkers - 1) / nWorkers
 
@@ -530,6 +537,12 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
 			lastT := chunk[len(chunk)-1]
 			rangeLen := int64(b.meta.Tensors().Offset+lastT.Offset+lastT.Size()) - firstOff
 			fadviseSequential(file.Fd(), firstOff, rangeLen)
+
+			slog.Debug("tensor loader worker started",
+				"worker", w,
+				"tensors", len(chunk),
+				"offset_range_mb", float64(rangeLen)/(1024*1024),
+			)
 
 			for _, t := range chunk {
 				if err := ctx.Err(); err != nil {
