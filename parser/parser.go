@@ -218,16 +218,46 @@ func fileDigestMap(path string) (map[string]string, error) {
 }
 
 func digestForFile(filename string) (string, error) {
-	filepath, err := filepath.EvalSymlinks(filename)
+	fpath, err := filepath.EvalSymlinks(filename)
 	if err != nil {
 		return "", err
 	}
 
-	bin, err := os.Open(filepath)
+	bin, err := os.Open(fpath)
 	if err != nil {
 		return "", err
 	}
 	defer bin.Close()
+
+	fi, err := bin.Stat()
+	if err != nil {
+		return "", err
+	}
+
+	// For large files (>1GB), use a fast digest based on file metadata +
+	// partial content (first and last 4MB) instead of hashing the entire
+	// file. This avoids reading 200GB+ model files over NFS just to
+	// compute an identifier.
+	if fi.Size() > 1<<30 {
+		hash := sha256.New()
+		// Include size and mtime for uniqueness
+		fmt.Fprintf(hash, "fast-digest:size=%d:mtime=%d:", fi.Size(), fi.ModTime().UnixNano())
+
+		// Hash first 4MB
+		buf := make([]byte, 4*1024*1024)
+		n, _ := io.ReadFull(bin, buf)
+		hash.Write(buf[:n])
+
+		// Hash last 4MB
+		if fi.Size() > int64(len(buf)) {
+			if _, err := bin.Seek(-int64(len(buf)), io.SeekEnd); err == nil {
+				n, _ = io.ReadFull(bin, buf)
+				hash.Write(buf[:n])
+			}
+		}
+
+		return fmt.Sprintf("sha256:%x", hash.Sum(nil)), nil
+	}
 
 	hash := sha256.New()
 	if _, err := io.Copy(hash, bin); err != nil {
