@@ -109,6 +109,10 @@ func (minimaxm2EventToolCall) isMiniMaxM2Event()        {}
 
 func (p *MiniMaxM2Parser) Add(s string, done bool) (content string, thinking string, calls []api.ToolCall, err error) {
 	p.buffer.WriteString(s)
+	// Log raw tokens as they arrive (at DEBUG level to avoid noise in production)
+	if strings.Contains(s, "<minimax:tool_call>") || strings.Contains(s, "<invoke") || strings.Contains(s, "<parameter") {
+		slog.Debug("minimaxm2: raw chunk with tool markup", "chunk", s, "state", p.state, "buffer_len", p.buffer.Len())
+	}
 	events := p.parseEvents()
 
 	// Check for critical errors
@@ -280,6 +284,9 @@ func (p *MiniMaxM2Parser) eat() ([]minimaxm2Event, bool) {
 			p.state = MiniMaxM2CollectingContent
 
 			// Parse all <invoke> blocks within this tool call block
+			slog.Info("minimaxm2: raw tool call block received",
+				"block_length", len(toolCallBlock),
+				"block_content", toolCallBlock)
 			toolCalls, errs := p.parseToolCallBlock(toolCallBlock)
 			// If there were critical errors (unknown tools), don't emit any events
 			// This allows errors to propagate properly
@@ -385,6 +392,35 @@ func (p *MiniMaxM2Parser) parseToolCallBlock(content string) ([]api.ToolCall, []
 
 // parseInvoke extracts the function name and parameters from an <invoke> block
 func (p *MiniMaxM2Parser) parseInvoke(functionName string, content string) (api.ToolCall, error) {
+	slog.Info("minimaxm2: parseInvoke called",
+		"function", functionName,
+		"content_length", len(content),
+		"content_preview", content[:min(200, len(content))])
+
+	// Clean up orphan closing tags (e.g. </parameter> without a matching
+	// <parameter>) that MiniMax sometimes emits as a "stutter".
+	if idx := strings.Index(content, minimaxm2ParameterOpenPrefix); idx == -1 {
+		// No <parameter at all — strip all orphan </parameter>
+		content = strings.ReplaceAll(content, minimaxm2ParameterCloseTag, "")
+	} else if idx > 0 {
+		// Strip orphan </parameter> that appear before the first <parameter
+		prefix := content[:idx]
+		if strings.Contains(prefix, minimaxm2ParameterCloseTag) {
+			prefix = strings.ReplaceAll(prefix, minimaxm2ParameterCloseTag, "")
+			content = prefix + content[idx:]
+			slog.Debug("minimaxm2: stripped orphan </parameter> tags",
+				"function", functionName)
+		}
+	}
+
+	// Log empty invoke blocks but pass them through — the client needs to
+	// see the tool call (even with empty args) so it can return an error
+	// and let the model retry with proper parameters.
+	if !strings.Contains(content, minimaxm2ParameterOpenPrefix) {
+		slog.Warn("minimaxm2: empty invoke (no parameters), passing through for client retry",
+			"function", functionName)
+	}
+
 	// Validate tool exists
 	tool := p.findToolByName(functionName)
 	if tool == nil {
@@ -396,8 +432,8 @@ func (p *MiniMaxM2Parser) parseInvoke(functionName string, content string) (api.
 		p.err = fmt.Errorf("model called unknown tool %q - available tools: %v (ensure tools are provided in API request)", functionName, availableTools)
 		slog.Error("MiniMaxM2 model attempted to call unregistered tool",
 			"tool", functionName,
-			"available_tools", availableTools,
-			"recommendation", "ensure tools array includes this tool in API request")
+			"invoke_content", content,
+			"available_tools", availableTools)
 		return api.ToolCall{}, p.err
 	}
 
