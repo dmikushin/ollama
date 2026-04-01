@@ -20,7 +20,6 @@ import (
 	"log/slog"
 	"maps"
 	"os"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -496,128 +495,150 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
 	var doneBytes atomic.Uint64
 	totalBytes := uint64(b.meta.Length) - b.meta.Tensors().Offset
 
+	// Sort tensors by file offset so each worker reads sequentially,
+	// enabling kernel readahead and NFS prefetch.
+	tensors := b.meta.Tensors().Items()
+	slices.SortFunc(tensors, func(a, b *fsggml.Tensor) int {
+		return cmp.Compare(a.Offset, b.Offset)
+	})
+
+	// Use a fixed pool of workers (8), each with its own FD reading its
+	// chunk of tensors in offset order. This limits NFS connections and
+	// gives each FD a sequential access pattern for effective readahead.
+	const nWorkers = 8
 	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(runtime.GOMAXPROCS(0))
-	for _, t := range b.meta.Tensors().Items() {
+	chunkSize := (len(tensors) + nWorkers - 1) / nWorkers
+
+	for w := range nWorkers {
+		start := w * chunkSize
+		if start >= len(tensors) {
+			break
+		}
+		end := min(start+chunkSize, len(tensors))
+		chunk := tensors[start:end]
+
 		g.Go(func() error {
-			tts := make([]*C.struct_ggml_tensor, max(1, len(b.tensorLoadTargets[t.Name])))
-			for i := range tts {
-				target := b.tensorLoadTargets[t.Name][i]
-				if target == "" {
-					target = t.Name
-				}
-
-				tt, ok := b.tensors[target]
-				if !ok {
-					return fmt.Errorf("unassigned tensor: %s", t.Name)
-				}
-
-				tts[i] = tt
-			}
-
-			// Create a new FD for each goroutine so that each FD is read sequentially, rather than
-			// seeking around within an FD shared between all goroutines.
 			file, err := os.Open(b.modelPath)
 			if err != nil {
 				slog.Warn("file open error", "file", b.modelPath, "error", err)
 				return err
 			}
 			defer file.Close()
-			sr := io.NewSectionReader(file, int64(b.meta.Tensors().Offset+t.Offset), int64(t.Size()))
 
-			if t.Kind == 4 && tts[0]._type == 39 {
-				// source is mxfp4, target is ggml mxfp4
+			// Hint the kernel that this FD will be read sequentially.
+			firstOff := int64(b.meta.Tensors().Offset + chunk[0].Offset)
+			lastT := chunk[len(chunk)-1]
+			rangeLen := int64(b.meta.Tensors().Offset+lastT.Offset+lastT.Size()) - firstOff
+			fadviseSequential(file.Fd(), firstOff, rangeLen)
 
-				const BS = 17                             // MXFP4 block size
-				bts := make([]byte, 8*BS*format.KibiByte) // ~128k block aligned
-				var s uint64
-				var tmp [16]byte
-				for s < t.Size() {
-					// Stop if either the parent context has been canceled or if any of the other tensors returned an error
-					if err := ctx.Err(); err != nil {
-						return err
-					}
-					n, err := io.ReadFull(sr, bts[:min(len(bts), int(t.Size()-s))])
-					if err != nil {
-						slog.Warn("file read error", "file", b.modelPath, "error", err)
-						return err
-					}
-					for j := range n / BS {
-						for i := 1; i < 9; i++ {
-							// transform a1b2c3 ... x7y8z9 -> 71xa82yb93zc
-							a, b := bts[j*BS+i], bts[j*BS+i+8]
-							tmp[2*(i-1)] = (a & 0x0F) | (b << 4)
-							tmp[2*(i-1)+1] = (a >> 4) | (b & 0xF0)
-						}
-						copy(bts[j*BS+1:j*BS+17], tmp[:])
-					}
-
-					for _, tt := range tts {
-						C.ggml_backend_tensor_set(tt, unsafe.Pointer(&bts[0]), C.size_t(s), C.size_t(n))
-					}
-
-					s += uint64(n)
-
-					if progress != nil {
-						done := doneBytes.Add(uint64(n))
-						progress(float32(done) / float32(totalBytes))
-					}
-				}
-				return nil
-			} else if strings.HasSuffix(t.Name, "_exps.bias") && t.Kind == 30 && tts[0]._type == 0 {
-				// source is bf16, target is ggml fp32
-
-				// data is bf16 but we need to convert to fp32
-				bts := make([]byte, 4*format.MebiByte)
-				var e uint64
-				for e < t.Elements() {
-					// Stop if either the parent context has been canceled or if any of the other tensors returned an error
-					if err := ctx.Err(); err != nil {
-						return err
-					}
-					n, err := io.ReadFull(sr, bts[:min(len(bts), int(t.Elements()-e)*2)])
-					if err != nil {
-						slog.Warn("file read error", "file", b.modelPath, "error", err)
-						return err
-					}
-					fp32 := ConvertToF32(bts, uint32(fsggml.TensorTypeBF16), uint64(n/2))
-
-					for _, tt := range tts {
-						C.ggml_backend_tensor_set(tt, unsafe.Pointer(&fp32[0]), C.size_t(e*4), C.size_t(n*2))
-					}
-					e += uint64(n / 2)
-					if progress != nil {
-						done := doneBytes.Add(uint64(n))
-						progress(float32(done) / float32(totalBytes))
-					}
-				}
-				return nil
-			}
-
-			bts := make([]byte, 4*format.MebiByte)
-
-			var s uint64
-			for s < t.Size() {
-				// Stop if either the parent context has been canceled or if any of the other tensors returned an error
+			for _, t := range chunk {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
 
-				n, err := io.ReadFull(sr, bts[:min(len(bts), int(t.Size()-s))])
-				if err != nil {
-					slog.Warn("file read error", "file", b.modelPath, "error", err)
-					return err
+				tts := make([]*C.struct_ggml_tensor, max(1, len(b.tensorLoadTargets[t.Name])))
+				for i := range tts {
+					target := b.tensorLoadTargets[t.Name][i]
+					if target == "" {
+						target = t.Name
+					}
+
+					tt, ok := b.tensors[target]
+					if !ok {
+						return fmt.Errorf("unassigned tensor: %s", t.Name)
+					}
+
+					tts[i] = tt
 				}
 
-				for _, tt := range tts {
-					C.ggml_backend_tensor_set(tt, unsafe.Pointer(&bts[0]), C.size_t(s), C.size_t(n))
-				}
+				sr := io.NewSectionReader(file, int64(b.meta.Tensors().Offset+t.Offset), int64(t.Size()))
 
-				s += uint64(n)
+				if t.Kind == 4 && tts[0]._type == 39 {
+					// source is mxfp4, target is ggml mxfp4
 
-				if progress != nil {
-					done := doneBytes.Add(uint64(n))
-					progress(float32(done) / float32(totalBytes))
+					const BS = 17                             // MXFP4 block size
+					bts := make([]byte, 8*BS*format.KibiByte) // ~128k block aligned
+					var s uint64
+					var tmp [16]byte
+					for s < t.Size() {
+						if err := ctx.Err(); err != nil {
+							return err
+						}
+						n, err := io.ReadFull(sr, bts[:min(len(bts), int(t.Size()-s))])
+						if err != nil {
+							slog.Warn("file read error", "file", b.modelPath, "error", err)
+							return err
+						}
+						for j := range n / BS {
+							for i := 1; i < 9; i++ {
+								a, b := bts[j*BS+i], bts[j*BS+i+8]
+								tmp[2*(i-1)] = (a & 0x0F) | (b << 4)
+								tmp[2*(i-1)+1] = (a >> 4) | (b & 0xF0)
+							}
+							copy(bts[j*BS+1:j*BS+17], tmp[:])
+						}
+
+						for _, tt := range tts {
+							C.ggml_backend_tensor_set(tt, unsafe.Pointer(&bts[0]), C.size_t(s), C.size_t(n))
+						}
+
+						s += uint64(n)
+
+						if progress != nil {
+							done := doneBytes.Add(uint64(n))
+							progress(float32(done) / float32(totalBytes))
+						}
+					}
+				} else if strings.HasSuffix(t.Name, "_exps.bias") && t.Kind == 30 && tts[0]._type == 0 {
+					// source is bf16, target is ggml fp32
+					bts := make([]byte, 4*format.MebiByte)
+					var e uint64
+					for e < t.Elements() {
+						if err := ctx.Err(); err != nil {
+							return err
+						}
+						n, err := io.ReadFull(sr, bts[:min(len(bts), int(t.Elements()-e)*2)])
+						if err != nil {
+							slog.Warn("file read error", "file", b.modelPath, "error", err)
+							return err
+						}
+						fp32 := ConvertToF32(bts, uint32(fsggml.TensorTypeBF16), uint64(n/2))
+
+						for _, tt := range tts {
+							C.ggml_backend_tensor_set(tt, unsafe.Pointer(&fp32[0]), C.size_t(e*4), C.size_t(n*2))
+						}
+						e += uint64(n / 2)
+						if progress != nil {
+							done := doneBytes.Add(uint64(n))
+							progress(float32(done) / float32(totalBytes))
+						}
+					}
+				} else {
+					bts := make([]byte, 4*format.MebiByte)
+
+					var s uint64
+					for s < t.Size() {
+						if err := ctx.Err(); err != nil {
+							return err
+						}
+
+						n, err := io.ReadFull(sr, bts[:min(len(bts), int(t.Size()-s))])
+						if err != nil {
+							slog.Warn("file read error", "file", b.modelPath, "error", err)
+							return err
+						}
+
+						for _, tt := range tts {
+							C.ggml_backend_tensor_set(tt, unsafe.Pointer(&bts[0]), C.size_t(s), C.size_t(n))
+						}
+
+						s += uint64(n)
+
+						if progress != nil {
+							done := doneBytes.Add(uint64(n))
+							progress(float32(done) / float32(totalBytes))
+						}
+					}
 				}
 			}
 
