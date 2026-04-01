@@ -1,7 +1,9 @@
 #include "llama-model-loader.h"
+#include "llama-nfs-opt.h"
 
 #include "ggml.h"
 
+#include <algorithm>
 #include <array>
 #include <cinttypes>
 #include <cstring>
@@ -466,7 +468,7 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<int, 4>>(enum llm_kv kid, std::array<int, 4> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum llm_kv kid, std::array<float, 512> & result, uint32_t n, bool required);
-    template bool llama_model_loader::get_key_or_arr<uint32_t>(const std::string & key, std::array<uint32_t, 512> & result, uint32_t n, bool required);
+
 
 llama_model_loader::llama_model_loader(
         const std::string & fname,
@@ -1021,6 +1023,52 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    // --- Prefetch thread for mmap path ---
+    // Collect tensor regions sorted by offset and start a background thread
+    // that calls madvise(MADV_WILLNEED) ahead of the main loading loop.
+    llama_mmap_prefetcher prefetcher;
+    std::vector<std::pair<size_t, size_t>> prefetch_regions;
+    if (use_mmap && !mappings.empty()) {
+        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const auto * w = get_weight(ggml_get_name(t));
+            if (w) {
+                prefetch_regions.emplace_back(w->offs, ggml_nbytes(t));
+            }
+        }
+        // Sort by offset for sequential prefetch
+        std::sort(prefetch_regions.begin(), prefetch_regions.end());
+        prefetcher.start(mappings.at(0)->addr(), prefetch_regions);
+    }
+
+    // --- O_DIRECT reader for non-mmap path ---
+    // Bypasses page cache for large models that don't fit in RAM, reducing
+    // cache thrashing and memory pressure. Re-opens the file via /proc/self/fd
+    // to get O_DIRECT without needing the original path.
+    std::unique_ptr<llama_direct_reader> direct_reader;
+    if (!use_mmap && !files.empty()) {
+        try {
+            char proc_path[64];
+            snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", files.at(0)->file_id());
+            direct_reader = std::make_unique<llama_direct_reader>(proc_path);
+            if (direct_reader->is_direct()) {
+                LLAMA_LOG_INFO("%s: using O_DIRECT for model loading (bypassing page cache)\n", __func__);
+            }
+        } catch (...) {
+            // O_DIRECT not available, will use regular reads
+        }
+    }
+
+    // --- io_uring reader for non-mmap async GPU upload path ---
+    // Pipelines read requests so NFS can serve multiple RPCs concurrently.
+    std::unique_ptr<llama_uring_reader> uring_reader;
+    if (upload_backend && !use_mmap && !files.empty()) {
+        if (llama_uring_reader::supported()) {
+            uring_reader = std::make_unique<llama_uring_reader>(files.at(0)->file_id(), 32);
+        }
+    }
+
+    size_t prefetch_idx = 0;
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1030,6 +1078,7 @@ bool llama_model_loader::load_all_data(
 
         if (progress_callback) {
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                prefetcher.stop();
                 return false;
             }
         }
@@ -1064,34 +1113,75 @@ bool llama_model_loader::load_all_data(
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
+
+            // Advance prefetcher so it stays ahead
+            prefetcher.advance(++prefetch_idx);
         } else {
             const auto & file = files.at(weight->idx);
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
+                if (direct_reader) {
+                    direct_reader->pread_aligned(cur->data, n_size, weight->offs);
+                } else {
+                    file->seek(weight->offs, SEEK_SET);
+                    file->read_raw(cur->data, n_size);
+                }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
                     }));
                 }
             } else {
-                // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
                 if (upload_backend) {
-                    file->seek(weight->offs, SEEK_SET);
+                    // Use io_uring for pipelined reads when available, otherwise fall back to blocking reads.
+                    // Both paths upload to GPU asynchronously via staging buffers.
+                    if (uring_reader) {
+                        // io_uring path: submit reads ahead and reap completions
+                        size_t bytes_read = 0;
+                        while (bytes_read < n_size) {
+                            size_t read_iteration = std::min<size_t>(buffer_size, n_size - bytes_read);
 
-                    size_t bytes_read = 0;
+                            ggml_backend_event_synchronize(events[buffer_idx]);
 
-                    while (bytes_read < n_size) {
-                        size_t read_iteration = std::min<size_t>(buffer_size, n_size - bytes_read);
+                            uint64_t token = uring_reader->submit_read(
+                                host_ptrs[buffer_idx], read_iteration, weight->offs + bytes_read);
+                            if (token == 0) {
+                                // io_uring submit failed, fall back to sync read
+                                file->seek(weight->offs + bytes_read, SEEK_SET);
+                                file->read_raw(host_ptrs[buffer_idx], read_iteration);
+                            } else {
+                                auto [_, n] = uring_reader->wait_one();
+                                if (n < 0 || (size_t)n < read_iteration) {
+                                    // Short/failed read, fall back to sync
+                                    file->seek(weight->offs + bytes_read, SEEK_SET);
+                                    file->read_raw(host_ptrs[buffer_idx], read_iteration);
+                                }
+                            }
 
-                        ggml_backend_event_synchronize(events[buffer_idx]);
-                        file->read_raw(host_ptrs[buffer_idx], read_iteration);
-                        ggml_backend_tensor_set_async(upload_backend, cur, host_ptrs[buffer_idx], bytes_read, read_iteration);
-                        ggml_backend_event_record(events[buffer_idx], upload_backend);
+                            ggml_backend_tensor_set_async(upload_backend, cur, host_ptrs[buffer_idx], bytes_read, read_iteration);
+                            ggml_backend_event_record(events[buffer_idx], upload_backend);
 
-                        bytes_read += read_iteration;
-                        ++buffer_idx;
-                        buffer_idx %= n_buffers;
+                            bytes_read += read_iteration;
+                            ++buffer_idx;
+                            buffer_idx %= n_buffers;
+                        }
+                    } else {
+                        // Blocking read path (original)
+                        file->seek(weight->offs, SEEK_SET);
+
+                        size_t bytes_read = 0;
+
+                        while (bytes_read < n_size) {
+                            size_t read_iteration = std::min<size_t>(buffer_size, n_size - bytes_read);
+
+                            ggml_backend_event_synchronize(events[buffer_idx]);
+                            file->read_raw(host_ptrs[buffer_idx], read_iteration);
+                            ggml_backend_tensor_set_async(upload_backend, cur, host_ptrs[buffer_idx], bytes_read, read_iteration);
+                            ggml_backend_event_record(events[buffer_idx], upload_backend);
+
+                            bytes_read += read_iteration;
+                            ++buffer_idx;
+                            buffer_idx %= n_buffers;
+                        }
                     }
                 } else {
                     read_buf.resize(n_size);
@@ -1107,6 +1197,8 @@ bool llama_model_loader::load_all_data(
 
         size_done += n_size;
     }
+
+    prefetcher.stop();
 
     // free temporary resources used for async uploads
     for (auto * event : events) {
