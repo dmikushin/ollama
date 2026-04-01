@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/containerd/console"
+	"github.com/ollama/ollama/manifest"
 	"github.com/mattn/go-runewidth"
 	"github.com/olekukonko/tablewriter"
 	"github.com/pkg/browser"
@@ -356,12 +357,51 @@ func createBlob(cmd *cobra.Command, client *api.Client, path string, digest stri
 	}
 	defer bin.Close()
 
-	// Get file info to retrieve the size
 	fileInfo, err := bin.Stat()
 	if err != nil {
 		return "", err
 	}
 	fileSize := fileInfo.Size()
+
+	// For large files (>1GB), try to create a hardlink directly into the
+	// blob store instead of streaming the entire file through HTTP and
+	// re-hashing it. This avoids reading 200GB+ model files twice.
+	if fileSize > 1<<30 {
+		blobPath, err := manifest.BlobsPath(digest)
+		if err == nil {
+			if _, err := os.Stat(blobPath); err == nil {
+				// Blob already exists — nothing to do
+				status := fmt.Sprintf("using existing blob %s", digest)
+				spinner := progress.NewSpinner(status)
+				p.Add(status, spinner)
+				spinner.Stop()
+				return digest, nil
+			}
+
+			// Try hardlink first (same filesystem), then symlink
+			if err := os.Link(realPath, blobPath); err == nil {
+				slog.Info("created hardlink for large blob", "path", realPath, "blob", blobPath, "size", fileSize)
+				status := fmt.Sprintf("linked file %s", digest)
+				spinner := progress.NewSpinner(status)
+				p.Add(status, spinner)
+				spinner.Stop()
+				return digest, nil
+			}
+
+			// Hardlink failed (cross-device) — try symlink
+			if err := os.Symlink(realPath, blobPath); err == nil {
+				slog.Info("created symlink for large blob", "path", realPath, "blob", blobPath, "size", fileSize)
+				status := fmt.Sprintf("linked file %s", digest)
+				spinner := progress.NewSpinner(status)
+				p.Add(status, spinner)
+				spinner.Stop()
+				return digest, nil
+			}
+
+			// Both failed — fall through to HTTP upload
+			slog.Debug("hardlink/symlink failed, falling back to HTTP upload", "path", realPath)
+		}
+	}
 
 	var pw progressWriter
 	status := fmt.Sprintf("copying file %s 0%%", digest)
