@@ -283,7 +283,9 @@ struct llama_mmap::impl {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
-        if (prefetch) { flags |= MAP_POPULATE; }
+        // MAP_POPULATE removed: it blocks until all pages are faulted in,
+        // which is extremely slow on network filesystems (NFS). Instead,
+        // rely on MADV_WILLNEED + sequential fadvise for async prefetch.
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
