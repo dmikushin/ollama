@@ -37,16 +37,26 @@ struct llama_mmap_prefetcher::impl {
                         regions->size(), ahead_count);
         size_t prefetch_idx = 0;
         size_t total_bytes_prefetched = 0;
+        size_t error_count = 0;
         while (!should_stop.load(std::memory_order_relaxed)) {
             size_t target = main_idx.load(std::memory_order_relaxed) + ahead_count;
             while (prefetch_idx < target && prefetch_idx < regions->size()) {
                 auto [off, len] = (*regions)[prefetch_idx];
                 int rc = posix_madvise(static_cast<char *>(addr) + off, len, POSIX_MADV_WILLNEED);
                 if (rc != 0) {
-                    LLAMA_LOG_WARN("prefetch madvise(WILLNEED) failed at offset %zu, len %zu: %s\n",
-                                   off, len, strerror(rc));
+                    if (++error_count <= 1) {
+                        LLAMA_LOG_WARN("prefetch madvise(WILLNEED) failed at offset %zu, len %zu: %s "
+                                       "(suppressing further errors)\n", off, len, strerror(rc));
+                    }
+                    if (rc == EINVAL) {
+                        // Addresses are invalid for this mapping — stop prefetching
+                        LLAMA_LOG_WARN("prefetch thread stopping: madvise returned EINVAL "
+                                       "(%zu errors in %zu regions)\n", error_count, prefetch_idx + 1);
+                        return;
+                    }
+                } else {
+                    total_bytes_prefetched += len;
                 }
-                total_bytes_prefetched += len;
                 prefetch_idx++;
             }
             std::unique_lock<std::mutex> lock(mtx);
@@ -55,8 +65,9 @@ struct llama_mmap_prefetcher::impl {
                        main_idx.load(std::memory_order_relaxed) + ahead_count > prefetch_idx;
             });
         }
-        LLAMA_LOG_DEBUG("prefetch thread finished, prefetched %zu regions (%.1f MB)\n",
-                        prefetch_idx, (double)total_bytes_prefetched / (1024.0 * 1024.0));
+        LLAMA_LOG_DEBUG("prefetch thread finished, prefetched %zu/%zu regions (%.1f MB), %zu errors\n",
+                        prefetch_idx, regions->size(),
+                        (double)total_bytes_prefetched / (1024.0 * 1024.0), error_count);
     }
 };
 
