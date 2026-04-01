@@ -30,32 +30,50 @@ struct llama_mmap_prefetcher::impl {
     std::atomic<bool> should_stop{false};
 
     void * addr = nullptr;
+    size_t mapping_size = 0;
     const std::vector<std::pair<size_t, size_t>> * regions = nullptr;
 
     void run() {
-        LLAMA_LOG_DEBUG("prefetch thread started, %zu regions, ahead_count=%zu\n",
-                        regions->size(), ahead_count);
+        long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0) { page_size = 4096; }
+
+        LLAMA_LOG_DEBUG("prefetch thread started, %zu regions, ahead_count=%zu, mapping_size=%.1f MB, page_size=%ld\n",
+                        regions->size(), ahead_count, (double)mapping_size / (1024.0 * 1024.0), page_size);
         size_t prefetch_idx = 0;
         size_t total_bytes_prefetched = 0;
-        size_t error_count = 0;
+        size_t skipped = 0;
         while (!should_stop.load(std::memory_order_relaxed)) {
             size_t target = main_idx.load(std::memory_order_relaxed) + ahead_count;
             while (prefetch_idx < target && prefetch_idx < regions->size()) {
                 auto [off, len] = (*regions)[prefetch_idx];
-                int rc = posix_madvise(static_cast<char *>(addr) + off, len, POSIX_MADV_WILLNEED);
+
+                // Align offset down and end up to page boundaries
+                size_t aligned_off = off & ~((size_t)page_size - 1);
+                size_t end = off + len;
+                size_t aligned_end = (end + page_size - 1) & ~((size_t)page_size - 1);
+
+                // Clamp to mapping bounds
+                if (aligned_off >= mapping_size) {
+                    skipped++;
+                    prefetch_idx++;
+                    continue;
+                }
+                if (aligned_end > mapping_size) {
+                    aligned_end = mapping_size & ~((size_t)page_size - 1);
+                }
+                if (aligned_end <= aligned_off) {
+                    skipped++;
+                    prefetch_idx++;
+                    continue;
+                }
+
+                size_t aligned_len = aligned_end - aligned_off;
+                int rc = posix_madvise(static_cast<char *>(addr) + aligned_off, aligned_len, POSIX_MADV_WILLNEED);
                 if (rc != 0) {
-                    if (++error_count <= 1) {
-                        LLAMA_LOG_WARN("prefetch madvise(WILLNEED) failed at offset %zu, len %zu: %s "
-                                       "(suppressing further errors)\n", off, len, strerror(rc));
-                    }
-                    if (rc == EINVAL) {
-                        // Addresses are invalid for this mapping — stop prefetching
-                        LLAMA_LOG_WARN("prefetch thread stopping: madvise returned EINVAL "
-                                       "(%zu errors in %zu regions)\n", error_count, prefetch_idx + 1);
-                        return;
-                    }
+                    skipped++;
+                    // Don't log individual errors — just count them
                 } else {
-                    total_bytes_prefetched += len;
+                    total_bytes_prefetched += aligned_len;
                 }
                 prefetch_idx++;
             }
@@ -65,9 +83,9 @@ struct llama_mmap_prefetcher::impl {
                        main_idx.load(std::memory_order_relaxed) + ahead_count > prefetch_idx;
             });
         }
-        LLAMA_LOG_DEBUG("prefetch thread finished, prefetched %zu/%zu regions (%.1f MB), %zu errors\n",
-                        prefetch_idx, regions->size(),
-                        (double)total_bytes_prefetched / (1024.0 * 1024.0), error_count);
+        LLAMA_LOG_INFO("prefetch thread done: %zu/%zu regions prefetched (%.1f MB), %zu skipped\n",
+                       prefetch_idx - skipped, regions->size(),
+                       (double)total_bytes_prefetched / (1024.0 * 1024.0), skipped);
     }
 };
 
@@ -78,8 +96,9 @@ llama_mmap_prefetcher::~llama_mmap_prefetcher() {
     delete pimpl;
 }
 
-void llama_mmap_prefetcher::start(void * addr, const std::vector<std::pair<size_t, size_t>> & regions) {
+void llama_mmap_prefetcher::start(void * addr, size_t mapping_size, const std::vector<std::pair<size_t, size_t>> & regions) {
     pimpl->addr = addr;
+    pimpl->mapping_size = mapping_size;
     pimpl->regions = &regions;
     pimpl->should_stop.store(false);
     pimpl->main_idx.store(0);
@@ -104,7 +123,7 @@ void llama_mmap_prefetcher::stop() {
 struct llama_mmap_prefetcher::impl {};
 llama_mmap_prefetcher::llama_mmap_prefetcher() : pimpl(nullptr) {}
 llama_mmap_prefetcher::~llama_mmap_prefetcher() {}
-void llama_mmap_prefetcher::start(void *, const std::vector<std::pair<size_t, size_t>> &) {}
+void llama_mmap_prefetcher::start(void *, size_t, const std::vector<std::pair<size_t, size_t>> &) {}
 void llama_mmap_prefetcher::advance(size_t) {}
 void llama_mmap_prefetcher::stop() {}
 

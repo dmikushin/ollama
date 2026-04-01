@@ -24,8 +24,9 @@ struct llama_mmap_prefetcher {
     ~llama_mmap_prefetcher();
 
     // Start prefetching tensor regions. regions = {offset, length} pairs,
-    // already sorted by offset. addr = mmap base address.
-    void start(void * addr, const std::vector<std::pair<size_t, size_t>> & regions);
+    // already sorted by offset. addr = mmap base address, mapping_size =
+    // total size of the mmap region (for bounds checking).
+    void start(void * addr, size_t mapping_size, const std::vector<std::pair<size_t, size_t>> & regions);
 
     // Signal that the main thread has finished processing tensor at index i.
     // The prefetcher will stay ahead_count tensors ahead.

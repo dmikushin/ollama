@@ -1044,7 +1044,7 @@ bool llama_model_loader::load_all_data(
                        __func__, prefetch_regions.size(),
                        (double)total_prefetch_bytes / (1024.0 * 1024.0));
 
-        prefetcher.start(mappings.at(0)->addr(), prefetch_regions);
+        prefetcher.start(mappings.at(0)->addr(), mappings.at(0)->size(), prefetch_regions);
     }
 
     // --- O_DIRECT reader for non-mmap path ---
