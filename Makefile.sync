@@ -51,11 +51,11 @@ llama/patches/.%.patched: llama/patches/%.patch
 
 .PHONY: checkout
 checkout: $(WORKDIR)
-	git -C $(WORKDIR) fetch
+	git -C $(WORKDIR) fetch origin
 	git -C $(WORKDIR) checkout -f $(FETCH_HEAD)
 
 $(WORKDIR):
-	git clone $(UPSTREAM) $(WORKDIR)
+	git submodule update --init $@
 
 .PHONY: format-patches
 format-patches: llama/patches
@@ -67,8 +67,11 @@ format-patches: llama/patches
 		$(FETCH_HEAD)
 
 .PHONY: clean
-clean: checkout
+clean:
 	@git -C $(WORKDIR) am --abort || true
+	git submodule deinit -f $(WORKDIR)
+	git submodule update --init $(WORKDIR)
+	git -C $(WORKDIR) checkout -f $(FETCH_HEAD)
 	$(RM) llama/patches/.*.patched
 
 .PHONY: print-base
