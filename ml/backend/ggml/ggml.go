@@ -568,7 +568,7 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
 				// source is bf16, target is ggml fp32
 
 				// data is bf16 but we need to convert to fp32
-				bts := make([]byte, 128*format.KibiByte)
+				bts := make([]byte, 4*format.MebiByte)
 				var e uint64
 				for e < t.Elements() {
 					// Stop if either the parent context has been canceled or if any of the other tensors returned an error
@@ -594,7 +594,7 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
 				return nil
 			}
 
-			bts := make([]byte, 128*format.KibiByte)
+			bts := make([]byte, 4*format.MebiByte)
 
 			var s uint64
 			for s < t.Size() {
