@@ -633,24 +633,26 @@ func TestMiniMaxM2ParserErrors(t *testing.T) {
 		},
 	}
 
+	// Following vLLM behavior: unknown tools are NOT errors — they pass through
+	// to the client which handles validation.
 	tests := []struct {
 		name      string
 		input     string
-		wantError bool
+		wantCalls int
 	}{
 		{
-			name: "unknown tool",
+			name: "unknown tool passes through",
 			input: `<minimax:tool_call>
 <invoke name="unknown_function">
 <parameter name="param">value</parameter>
 </invoke>
 </minimax:tool_call>`,
-			wantError: true,
+			wantCalls: 1,
 		},
 		{
 			name:      "no tools provided but model makes tool call",
 			input:     `<minimax:tool_call>\n<invoke name="get_weather">\n<parameter name="location">Tokyo</parameter>\n</invoke>\n</minimax:tool_call>`,
-			wantError: true, // Should error when tool is not in registry
+			wantCalls: 1,
 		},
 	}
 
@@ -658,15 +660,17 @@ func TestMiniMaxM2ParserErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			parser := &MiniMaxM2Parser{}
 			if tt.name == "no tools provided but model makes tool call" {
-				parser.Init(nil, nil, nil) // No tools
+				parser.Init(nil, nil, nil)
 			} else {
 				parser.Init(tools, nil, nil)
 			}
 
-			_, _, _, err := parser.Add(tt.input, true)
-
-			if (err != nil) != tt.wantError {
-				t.Errorf("Add() error = %v, wantError %v", err, tt.wantError)
+			_, _, calls, err := parser.Add(tt.input, true)
+			if err != nil {
+				t.Errorf("Add() unexpected error: %v", err)
+			}
+			if len(calls) != tt.wantCalls {
+				t.Errorf("Add() got %d calls, want %d", len(calls), tt.wantCalls)
 			}
 		})
 	}

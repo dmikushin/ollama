@@ -2,7 +2,6 @@ package parsers
 
 import (
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"strings"
 	"unicode"
@@ -21,10 +20,10 @@ import (
 // And thinking format:
 // <think>thinking content</think>
 type MiniMaxM2Parser struct {
-	state  MiniMaxM2ParserState
-	buffer strings.Builder
-	tools  []api.Tool
-	err    error // Store critical errors (like unknown tools)
+	state     MiniMaxM2ParserState
+	buffer    strings.Builder
+	tools     []api.Tool
+	callIndex int
 }
 
 type MiniMaxM2ParserState int
@@ -81,7 +80,7 @@ func (p *MiniMaxM2Parser) setInitialState(lastMessage *api.Message, tools []api.
 
 func (p *MiniMaxM2Parser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.tools = tools
-	p.err = nil
+	p.callIndex = 0
 	p.setInitialState(lastMessage, tools, thinkValue)
 	return tools
 }
@@ -115,11 +114,6 @@ func (p *MiniMaxM2Parser) Add(s string, done bool) (content string, thinking str
 	}
 	events := p.parseEvents()
 
-	// Check for critical errors
-	if p.err != nil {
-		return "", "", nil, p.err
-	}
-
 	var toolCalls []api.ToolCall
 	var contentSb strings.Builder
 	var thinkingSb strings.Builder
@@ -141,7 +135,7 @@ func (p *MiniMaxM2Parser) parseEvents() []minimaxm2Event {
 	var all []minimaxm2Event
 
 	keepLooping := true
-	for keepLooping && p.err == nil {
+	for keepLooping {
 		var events []minimaxm2Event
 		events, keepLooping = p.eat()
 		if len(events) > 0 {
@@ -346,9 +340,7 @@ func (p *MiniMaxM2Parser) parseToolCallBlock(content string) ([]api.ToolCall, []
 		openingTag := remaining[invokeStartIdx : tagEndIdx+1]
 		functionName := extractNameAttribute(openingTag)
 		if functionName == "" {
-			err := fmt.Errorf("invoke tag missing name attribute: %s", openingTag)
 			slog.Warn("minimaxm2: invoke tag missing name attribute", "tag", openingTag)
-			errors = append(errors, err)
 			remaining = remaining[tagEndIdx+1:]
 			continue
 		}
@@ -390,51 +382,26 @@ func (p *MiniMaxM2Parser) parseToolCallBlock(content string) ([]api.ToolCall, []
 	return toolCalls, errors
 }
 
-// parseInvoke extracts the function name and parameters from an <invoke> block
+// parseInvoke extracts the function name and parameters from an <invoke> block.
+// Following the official vLLM minimax_m2 parser, we do NOT validate tool names —
+// the model output is parsed as-is and passed to the client, which handles errors.
 func (p *MiniMaxM2Parser) parseInvoke(functionName string, content string) (api.ToolCall, error) {
-	slog.Info("minimaxm2: parseInvoke called",
+	slog.Debug("minimaxm2: parseInvoke",
 		"function", functionName,
-		"content_length", len(content),
 		"content_preview", content[:min(200, len(content))])
 
-	// Clean up orphan closing tags (e.g. </parameter> without a matching
-	// <parameter>) that MiniMax sometimes emits as a "stutter".
-	if idx := strings.Index(content, minimaxm2ParameterOpenPrefix); idx == -1 {
-		// No <parameter at all — strip all orphan </parameter>
-		content = strings.ReplaceAll(content, minimaxm2ParameterCloseTag, "")
-	} else if idx > 0 {
-		// Strip orphan </parameter> that appear before the first <parameter
-		prefix := content[:idx]
-		if strings.Contains(prefix, minimaxm2ParameterCloseTag) {
-			prefix = strings.ReplaceAll(prefix, minimaxm2ParameterCloseTag, "")
-			content = prefix + content[idx:]
-			slog.Debug("minimaxm2: stripped orphan </parameter> tags",
-				"function", functionName)
+	// Look up tool schema for type conversion (optional — if not found, all params are strings)
+	var paramSchema map[string]any
+	for _, t := range p.tools {
+		if t.Function.Name == functionName {
+			if props := t.Function.Parameters.Properties; props != nil {
+				paramSchema = make(map[string]any)
+				for k, v := range props.ToMap() {
+					paramSchema[k] = v
+				}
+			}
+			break
 		}
-	}
-
-	// Log empty invoke blocks but pass them through — the client needs to
-	// see the tool call (even with empty args) so it can return an error
-	// and let the model retry with proper parameters.
-	if !strings.Contains(content, minimaxm2ParameterOpenPrefix) {
-		slog.Warn("minimaxm2: empty invoke (no parameters), passing through for client retry",
-			"function", functionName)
-	}
-
-	// Validate tool exists
-	tool := p.findToolByName(functionName)
-	if tool == nil {
-		availableTools := make([]string, len(p.tools))
-		for i, t := range p.tools {
-			availableTools[i] = t.Function.Name
-		}
-		// Store critical error to halt processing
-		p.err = fmt.Errorf("model called unknown tool %q - available tools: %v (ensure tools are provided in API request)", functionName, availableTools)
-		slog.Error("MiniMaxM2 model attempted to call unregistered tool",
-			"tool", functionName,
-			"invoke_content", content,
-			"available_tools", availableTools)
-		return api.ToolCall{}, p.err
 	}
 
 	// Extract all <parameter> tags
@@ -442,69 +409,110 @@ func (p *MiniMaxM2Parser) parseInvoke(functionName string, content string) (api.
 	remaining := content
 
 	for {
-		// Find next <parameter> tag
 		paramStartIdx := strings.Index(remaining, minimaxm2ParameterOpenPrefix)
 		if paramStartIdx == -1 {
 			break
 		}
 
-		// Find the end of the opening <parameter> tag (the '>')
 		tagEndIdx := strings.Index(remaining[paramStartIdx:], ">")
 		if tagEndIdx == -1 {
-			logutil.Trace("minimaxm2: incomplete parameter opening tag")
 			break
 		}
 		tagEndIdx += paramStartIdx
 
-		// Extract the opening tag to get the name attribute
 		openingTag := remaining[paramStartIdx : tagEndIdx+1]
 		paramName := extractNameAttribute(openingTag)
 		if paramName == "" {
-			slog.Warn("minimaxm2: parameter tag missing name attribute", "tag", openingTag)
 			remaining = remaining[tagEndIdx+1:]
 			continue
 		}
 
-		// Find the closing </parameter> tag
 		paramEndIdx := strings.Index(remaining[tagEndIdx+1:], minimaxm2ParameterCloseTag)
 		if paramEndIdx == -1 {
-			// Missing closing tag - conservative recovery
-			slog.Warn("minimaxm2: missing </parameter> tag for parameter, recovering", "parameter", paramName)
-			// Take everything until the next parameter or end of content
-			nextParamIdx := strings.Index(remaining[tagEndIdx+1:], minimaxm2ParameterOpenPrefix)
-			if nextParamIdx == -1 {
-				// No more parameters, take rest of content
-				paramValue := strings.TrimSpace(remaining[tagEndIdx+1:])
-				params.Set(paramName, parseParameterValue(paramValue))
-				break
+			// Missing closing tag — take content until next <parameter or end
+			nextIdx := strings.Index(remaining[tagEndIdx+1:], minimaxm2ParameterOpenPrefix)
+			var paramValue string
+			if nextIdx == -1 {
+				paramValue = strings.TrimSpace(remaining[tagEndIdx+1:])
 			} else {
-				// Take up to next parameter
-				paramValue := strings.TrimSpace(remaining[tagEndIdx+1 : tagEndIdx+1+nextParamIdx])
-				params.Set(paramName, parseParameterValue(paramValue))
-				remaining = remaining[tagEndIdx+1+nextParamIdx:]
+				paramValue = strings.TrimSpace(remaining[tagEndIdx+1 : tagEndIdx+1+nextIdx])
+				remaining = remaining[tagEndIdx+1+nextIdx:]
+				params.Set(paramName, convertParamValue(paramValue, paramName, paramSchema))
 				continue
 			}
+			params.Set(paramName, convertParamValue(paramValue, paramName, paramSchema))
+			break
 		}
 		paramEndIdx += tagEndIdx + 1
 
-		// Extract the parameter value
 		paramValue := strings.TrimSpace(remaining[tagEndIdx+1 : paramEndIdx])
-		params.Set(paramName, parseParameterValue(paramValue))
+		params.Set(paramName, convertParamValue(paramValue, paramName, paramSchema))
 
-		if v, ok := params.Get(paramName); ok {
-		logutil.Trace("minimaxm2: parsed parameter", "name", paramName, "value", v)
-	}
-
-		// Move past this parameter
 		remaining = remaining[paramEndIdx+len(minimaxm2ParameterCloseTag):]
 	}
 
 	return api.ToolCall{
 		Function: api.ToolCallFunction{
-			Name:      tool.Function.Name,
+			Name:      functionName,
 			Arguments: params,
 		},
 	}, nil
+}
+
+// convertParamValue converts a string parameter value to the type specified
+// in the tool's JSON schema, matching the vLLM minimax_m2 parser behavior.
+func convertParamValue(value, paramName string, schema map[string]any) any {
+	if schema == nil {
+		return parseParameterValue(value)
+	}
+
+	prop, ok := schema[paramName]
+	if !ok {
+		return parseParameterValue(value)
+	}
+
+	// Extract type from ToolProperty
+	propMap, ok := prop.(api.ToolProperty)
+	if !ok {
+		return parseParameterValue(value)
+	}
+
+	types := propMap.Type
+	if len(types) == 0 {
+		return parseParameterValue(value)
+	}
+
+	// Try types in priority order (matching vLLM)
+	for _, t := range types {
+		switch t {
+		case "integer", "int":
+			var v int64
+			if err := json.Unmarshal([]byte(value), &v); err == nil {
+				return v
+			}
+		case "number", "float":
+			var v float64
+			if err := json.Unmarshal([]byte(value), &v); err == nil {
+				return v
+			}
+		case "boolean", "bool":
+			switch strings.ToLower(strings.TrimSpace(value)) {
+			case "true", "1", "yes":
+				return true
+			case "false", "0", "no":
+				return false
+			}
+		case "object", "array":
+			var v any
+			if err := json.Unmarshal([]byte(value), &v); err == nil {
+				return v
+			}
+		case "string":
+			return value
+		}
+	}
+
+	return parseParameterValue(value)
 }
 
 // extractNameAttribute extracts the value of name="..." from an opening tag
@@ -557,12 +565,3 @@ func parseParameterValue(value string) any {
 	return value
 }
 
-func (p *MiniMaxM2Parser) findToolByName(name string) *api.Tool {
-	name = strings.TrimSpace(name)
-	for i := range p.tools {
-		if p.tools[i].Function.Name == name {
-			return &p.tools[i]
-		}
-	}
-	return nil
-}
