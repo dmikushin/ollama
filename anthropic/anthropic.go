@@ -373,7 +373,7 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 	}
 
 	var think *api.ThinkValue
-	if r.Thinking != nil && r.Thinking.Type == "enabled" {
+	if r.Thinking != nil && (r.Thinking.Type == "enabled" || r.Thinking.Type == "adaptive") {
 		think = &api.ThinkValue{Value: true}
 	}
 

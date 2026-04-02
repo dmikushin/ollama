@@ -399,6 +399,27 @@ func TestFromMessagesRequest_WithThinking(t *testing.T) {
 	}
 }
 
+func TestFromMessagesRequest_WithAdaptiveThinking(t *testing.T) {
+	req := MessagesRequest{
+		Model:     "test-model",
+		MaxTokens: 1024,
+		Messages:  []MessageParam{{Role: "user", Content: textContent("Hello")}},
+		Thinking:  &ThinkingConfig{Type: "adaptive"},
+	}
+
+	result, err := FromMessagesRequest(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.Think == nil {
+		t.Fatal("expected Think to be set for adaptive thinking")
+	}
+	if v, ok := result.Think.Value.(bool); !ok || !v {
+		t.Errorf("expected Think.Value to be true, got %v", result.Think.Value)
+	}
+}
+
 func TestFromMessagesRequest_ThinkingOnlyBlock(t *testing.T) {
 	req := MessagesRequest{
 		Model:     "test-model",
