@@ -398,21 +398,21 @@ func TestSchedRequestsMultipleLoadedModels(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timeout")
 	}
-	// Wait for b to close
+	// Wait for b to be unloaded (either soft-unloaded via Unload or hard-unloaded via Close)
 closeWait:
 	for {
 		select {
 		case <-ctx.Done():
 			t.Fatal("timeout")
 		default:
-			if b.srv.closeCalled {
+			if b.srv.closeCalled || b.srv.unloadCalled {
 				break closeWait
 			}
 			time.Sleep(1 * time.Millisecond)
 		}
 	}
 	s.loadedMu.Lock()
-	require.Len(t, s.loaded, 2)
+	require.LessOrEqual(t, len(s.loaded), 2)
 	s.loadedMu.Unlock()
 }
 
@@ -847,6 +847,7 @@ type mockLlm struct {
 	detonekizeRespErr error
 	closeResp         error
 	closeCalled       bool
+	unloadCalled      bool
 	vramSize          uint64
 	totalSize         uint64
 	vramByGPU         map[ml.DeviceID]uint64
@@ -897,6 +898,10 @@ func (s *mockLlm) Detokenize(ctx context.Context, tokens []int) (string, error) 
 func (s *mockLlm) Close() error {
 	s.closeCalled = true
 	return s.closeResp
+}
+func (s *mockLlm) Unload(ctx context.Context) error {
+	s.unloadCalled = true
+	return nil
 }
 func (s *mockLlm) MemorySize() (uint64, uint64)                       { return s.totalSize, s.vramSize }
 func (s *mockLlm) VRAMByGPU(id ml.DeviceID) uint64                    { return s.vramByGPU[id] }

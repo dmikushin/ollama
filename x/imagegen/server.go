@@ -354,6 +354,11 @@ func (s *Server) Completion(ctx context.Context, req llm.CompletionRequest, fn f
 	return scanErr
 }
 
+// Unload is not supported for image generation servers.
+func (s *Server) Unload(_ context.Context) error {
+	return fmt.Errorf("soft unload not supported for image generation runner")
+}
+
 // Close terminates the subprocess.
 func (s *Server) Close() error {
 	s.mu.Lock()

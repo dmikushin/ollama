@@ -305,6 +305,12 @@ type Server struct {
 
 	// next sequence for prompt processing to avoid starvation
 	nextSeq int
+
+	// runCancel cancels the run goroutine's context (used during soft unload)
+	runCancel context.CancelFunc
+
+	// runDone is closed when the run goroutine exits
+	runDone chan struct{}
 }
 
 func (s *Server) allNil() bool {
@@ -873,6 +879,87 @@ func (s *Server) loadModel(
 	s.ready.Done()
 }
 
+// unloadModel frees the model, context, and cache, but keeps the runner
+// process alive. This preserves the CUDA context and memory pools, avoiding
+// VRAM fragmentation and recovery delays on reload.
+func (s *Server) unloadModel() {
+	slog.Info("soft unloading model")
+
+	// Stop the run goroutine
+	if s.runCancel != nil {
+		s.runCancel()
+	}
+
+	// Wake up processBatch if it's blocked on cond.Wait
+	s.mu.Lock()
+	s.cond.Broadcast()
+	s.mu.Unlock()
+
+	// Wait for run goroutine to exit
+	if s.runDone != nil {
+		<-s.runDone
+	}
+
+	// Free resources in reverse order of creation
+	s.cache = nil
+
+	if s.image != nil {
+		s.image.Free(s.modelPath)
+		s.image = nil
+	}
+
+	if s.lc != nil {
+		llama.FreeContext(s.lc)
+		s.lc = nil
+	}
+
+	if s.model != nil {
+		llama.FreeModel(s.model)
+		s.model = nil
+	}
+
+	// Reset state for next load
+	s.seqs = nil
+	s.seqsSem = nil
+	s.status = llm.ServerStatusLaunched
+	s.progress = 0
+
+	// Prepare for next load cycle
+	s.ready.Add(1)
+
+	// Start new run goroutine
+	ctx, cancel := context.WithCancel(context.Background())
+	s.runCancel = cancel
+	s.runDone = make(chan struct{})
+	go func() {
+		s.run(ctx)
+		close(s.runDone)
+	}()
+
+	slog.Info("model unloaded, runner process ready for reload")
+}
+
+func (s *Server) handleUnload(w http.ResponseWriter, r *http.Request) {
+	s.loadMu.Lock()
+	defer s.loadMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if s.status == llm.ServerStatusLaunched {
+		// Already unloaded, nothing to do
+		if err := json.NewEncoder(w).Encode(&llm.LoadResponse{Success: true}); err != nil {
+			http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	s.unloadModel()
+
+	if err := json.NewEncoder(w).Encode(&llm.LoadResponse{Success: true}); err != nil {
+		http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
+	}
+}
+
 // load is the handler called by the Ollama server to process different
 // load operations
 func (s *Server) load(w http.ResponseWriter, r *http.Request) {
@@ -976,9 +1063,18 @@ func Execute(args []string) error {
 	server.cond = sync.NewCond(&server.mu)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	server.runCancel = cancel
+	server.runDone = make(chan struct{})
+	defer func() {
+		if server.runCancel != nil {
+			server.runCancel()
+		}
+	}()
 
-	go server.run(ctx)
+	go func() {
+		server.run(ctx)
+		close(server.runDone)
+	}()
 
 	addr := "127.0.0.1:" + strconv.Itoa(*port)
 	listener, err := net.Listen("tcp", addr)
@@ -990,6 +1086,7 @@ func Execute(args []string) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /load", server.load)
+	mux.HandleFunc("POST /unload", server.handleUnload)
 	mux.HandleFunc("/embedding", server.embeddings)
 	mux.HandleFunc("/completion", server.completion)
 	mux.HandleFunc("/health", server.health)

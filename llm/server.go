@@ -74,6 +74,10 @@ type LlamaServer interface {
 	Tokenize(ctx context.Context, content string) ([]int, error)
 	Detokenize(ctx context.Context, tokens []int) (string, error)
 	Close() error
+	// Unload frees the model and context within the runner process but keeps
+	// the process alive. This preserves the CUDA context and memory pools,
+	// allowing fast reload without VRAM fragmentation or recovery delays.
+	Unload(ctx context.Context) error
 	MemorySize() (total, vram uint64)
 	VRAMByGPU(id ml.DeviceID) uint64
 	Pid() int
@@ -1818,6 +1822,31 @@ func (s *ollamaServer) Detokenize(ctx context.Context, tokens []int) (string, er
 	}
 
 	return content, nil
+}
+
+func (s *llmServer) Unload(ctx context.Context) error {
+	if s.cmd == nil || s.cmd.ProcessState != nil {
+		return fmt.Errorf("runner process not running")
+	}
+
+	r, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/unload", s.port), nil)
+	if err != nil {
+		return fmt.Errorf("error creating unload request: %w", err)
+	}
+	r.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		return fmt.Errorf("unload request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("unload failed: %s", body)
+	}
+
+	return nil
 }
 
 func (s *llmServer) Close() error {

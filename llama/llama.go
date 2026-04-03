@@ -317,6 +317,13 @@ func FreeModel(model *Model) {
 	C.llama_model_free(model.c)
 }
 
+func FreeContext(ctx *Context) {
+	if ctx != nil && ctx.c != nil {
+		C.llama_free(ctx.c)
+		ctx.c = nil
+	}
+}
+
 func NewContextWithModel(model *Model, params ContextParams) (*Context, error) {
 	c := Context{
 		c:          C.llama_init_from_model(model.c, params.c),

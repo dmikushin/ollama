@@ -180,6 +180,11 @@ type CompletionResponse struct {
 	Error *api.StatusError
 }
 
+// Unload is not supported for MLX runners.
+func (c *Client) Unload(_ context.Context) error {
+	return fmt.Errorf("soft unload not supported for MLX runner")
+}
+
 // Close terminates the subprocess.
 func (c *Client) Close() error {
 	c.mu.Lock()

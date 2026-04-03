@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <sys/types.h>
 #include <vector>
 #include <functional>
 #include <atomic>

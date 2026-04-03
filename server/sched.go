@@ -35,13 +35,21 @@ type LlmRequest struct {
 	schedAttempts   uint
 }
 
+// cachedRunnerRef holds a soft-unloaded runner process that can be reused for
+// the same model. The model is freed inside the process but the process stays
+// alive, preserving the CUDA context and memory pools.
+type cachedRunnerRef struct {
+	llama    llm.LlamaServer
+	modelKey string
+}
+
 type Scheduler struct {
 	pendingReqCh  chan *LlmRequest
 	finishedReqCh chan *LlmRequest
 	expiredCh     chan *runnerRef
 	unloadedCh    chan any
 
-	// loadedMu protects loaded and activeLoading
+	// loadedMu protects loaded, activeLoading, and cachedRunner
 	loadedMu sync.Mutex
 
 	// activeLoading is the model that we are currently working on loading,
@@ -50,6 +58,10 @@ type Scheduler struct {
 	// happen in parallel
 	activeLoading llm.LlamaServer
 	loaded        map[string]*runnerRef
+
+	// cachedRunner holds a soft-unloaded runner process (model freed, process
+	// alive) for fast reload of the same model without VRAM recovery delays.
+	cachedRunner *cachedRunnerRef
 
 	loadFn          func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
 	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int) (llm.LlamaServer, error)
@@ -196,6 +208,22 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					slog.Debug("max runners achieved, unloading one to make room", "runner_count", loadedCount)
 					runnerToExpire = s.findRunnerToUnload()
 				} else {
+					// Check for a cached (soft-unloaded) runner process for the
+					// same model. If available, set it as activeLoading so that
+					// loadFn reuses the existing process instead of spawning one.
+					s.loadedMu.Lock()
+					if s.cachedRunner != nil && s.cachedRunner.modelKey == pendingKey {
+						if !s.cachedRunner.llama.HasExited() {
+							slog.Info("reusing cached runner process for reload", "model", pendingKey)
+							s.activeLoading = s.cachedRunner.llama
+						} else {
+							slog.Debug("cached runner process has exited, discarding", "model", pendingKey)
+							s.cachedRunner.llama.Close()
+						}
+						s.cachedRunner = nil
+					}
+					s.loadedMu.Unlock()
+
 					// Either no models are loaded or below envconfig.MaxRunners
 					// Get a refreshed GPU list
 					var gpus []ml.DeviceInfo
@@ -364,6 +392,26 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				runner.unload()
 				s.loadedMu.Unlock()
 				runner.refMu.Unlock()
+			} else if runner.sessionDuration > 0 && runner.softUnload() {
+				// Natural keepalive expiration (not forced eviction) and soft
+				// unload succeeded: model freed inside process, VRAM freed
+				// immediately. Cache the process for fast reload.
+				slog.Debug("soft unloaded runner, caching process for reload", "runner", runner)
+				// Close any previously cached runner from a different model
+				if s.cachedRunner != nil {
+					slog.Debug("closing previously cached runner", "modelKey", s.cachedRunner.modelKey)
+					s.cachedRunner.llama.Close()
+					s.cachedRunner = nil
+				}
+				s.cachedRunner = &cachedRunnerRef{
+					llama:    runner.llama,
+					modelKey: runner.modelKey,
+				}
+				runner.llama = nil // transfer ownership to cache
+				delete(s.loaded, runner.modelKey)
+				s.loadedMu.Unlock()
+				runner.refMu.Unlock()
+				s.unloadedCh <- struct{}{}
 			} else {
 				slog.Debug("starting background wait for VRAM recovery", "runner", runner)
 				runnersSnapshot := make([]ml.FilteredRunnerDiscovery, 0, len(s.loaded))
@@ -654,6 +702,30 @@ type runnerRef struct {
 	*api.Options
 }
 
+// softUnload frees the model within the runner process but keeps the process
+// alive. Returns true if successful. The refMu must already be held.
+func (runner *runnerRef) softUnload() bool {
+	if runner.llama == nil || runner.llama.HasExited() {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := runner.llama.Unload(ctx); err != nil {
+		slog.Warn("soft unload failed, will fall back to hard unload", "error", err, "runner", runner)
+		return false
+	}
+
+	if runner.expireTimer != nil {
+		runner.expireTimer.Stop()
+		runner.expireTimer = nil
+	}
+	// Keep runner.llama, runner.model, runner.gpus, runner.Options for potential reuse
+	slog.Info("model soft-unloaded, runner process kept alive for reload", "runner", runner)
+	return true
+}
+
 // The refMu must already be held when calling unload
 func (runner *runnerRef) unload() {
 	if runner.expireTimer != nil {
@@ -901,6 +973,12 @@ func (s *Scheduler) unloadAllRunners() {
 		slog.Debug("shutting down currently loading runner")
 		s.activeLoading.Close()
 		s.activeLoading = nil
+	}
+
+	if s.cachedRunner != nil {
+		slog.Debug("shutting down cached runner", "model", s.cachedRunner.modelKey)
+		s.cachedRunner.llama.Close()
+		s.cachedRunner = nil
 	}
 
 	for model, runner := range s.loaded {
