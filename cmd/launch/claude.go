@@ -26,16 +26,16 @@ func (c *Claude) args(model string, extra []string) []string {
 }
 
 func (c *Claude) findPath() (string, error) {
-	if p, err := exec.LookPath("claude"); err == nil {
+	if p, err := exec.LookPath("free-code"); err == nil {
 		return p, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	name := "claude"
+	name := "free-code"
 	if runtime.GOOS == "windows" {
-		name = "claude.exe"
+		name = "free-code.exe"
 	}
 	fallback := filepath.Join(home, ".claude", "local", name)
 	if _, err := os.Stat(fallback); err != nil {
@@ -47,7 +47,7 @@ func (c *Claude) findPath() (string, error) {
 func (c *Claude) Run(model string, args []string) error {
 	claudePath, err := c.findPath()
 	if err != nil {
-		return fmt.Errorf("claude is not installed, install from https://code.claude.com/docs/en/quickstart")
+		return fmt.Errorf("free-code is not installed, install from https://code.claude.com/docs/en/quickstart")
 	}
 
 	cmd := exec.Command(claudePath, c.args(model, args)...)

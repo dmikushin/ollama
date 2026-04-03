@@ -28,9 +28,9 @@ func TestClaudeFindPath(t *testing.T) {
 
 	t.Run("finds claude in PATH", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		name := "claude"
+		name := "free-code"
 		if runtime.GOOS == "windows" {
-			name = "claude.exe"
+			name = "free-code.exe"
 		}
 		fakeBin := filepath.Join(tmpDir, name)
 		os.WriteFile(fakeBin, []byte("#!/bin/sh\n"), 0o755)
@@ -50,9 +50,9 @@ func TestClaudeFindPath(t *testing.T) {
 		setTestHome(t, tmpDir)
 		t.Setenv("PATH", t.TempDir()) // empty dir, no claude binary
 
-		name := "claude"
+		name := "free-code"
 		if runtime.GOOS == "windows" {
-			name = "claude.exe"
+			name = "free-code.exe"
 		}
 		fallback := filepath.Join(tmpDir, ".claude", "local", name)
 		os.MkdirAll(filepath.Dir(fallback), 0o755)
