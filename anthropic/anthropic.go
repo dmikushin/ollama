@@ -212,8 +212,9 @@ type MessagesResponse struct {
 
 // Usage contains token usage information
 type Usage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens     int     `json:"input_tokens"`
+	OutputTokens    int     `json:"output_tokens"`
+	TokensPerSecond float64 `json:"tokens_per_second,omitempty"`
 }
 
 // Streaming event types
@@ -268,8 +269,9 @@ type MessageDelta struct {
 
 // DeltaUsage contains cumulative token usage
 type DeltaUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens     int     `json:"input_tokens"`
+	OutputTokens    int     `json:"output_tokens"`
+	TokensPerSecond float64 `json:"tokens_per_second,omitempty"`
 }
 
 // MessageStopEvent signals the end of the message
@@ -675,10 +677,16 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 		Model:      r.Model,
 		Content:    content,
 		StopReason: stopReason,
-		Usage: Usage{
-			InputTokens:  r.Metrics.PromptEvalCount,
-			OutputTokens: r.Metrics.EvalCount,
-		},
+		Usage: func() Usage {
+			u := Usage{
+				InputTokens:  r.Metrics.PromptEvalCount,
+				OutputTokens: r.Metrics.EvalCount,
+			}
+			if r.Metrics.EvalDuration > 0 {
+				u.TokensPerSecond = float64(r.Metrics.EvalCount) / r.Metrics.EvalDuration.Seconds()
+			}
+			return u
+		}(),
 	}
 }
 
@@ -929,6 +937,11 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 		c.outputTokens = r.Metrics.EvalCount
 		stopReason := mapStopReason(r.DoneReason, len(c.toolCallsSent) > 0)
 
+		var tokensPerSecond float64
+		if r.Metrics.EvalDuration > 0 {
+			tokensPerSecond = float64(r.Metrics.EvalCount) / r.Metrics.EvalDuration.Seconds()
+		}
+
 		events = append(events, StreamEvent{
 			Event: "message_delta",
 			Data: MessageDeltaEvent{
@@ -937,8 +950,9 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 					StopReason: stopReason,
 				},
 				Usage: DeltaUsage{
-					InputTokens:  c.inputTokens,
-					OutputTokens: c.outputTokens,
+					InputTokens:     c.inputTokens,
+					OutputTokens:    c.outputTokens,
+					TokensPerSecond: tokensPerSecond,
 				},
 			},
 		})
