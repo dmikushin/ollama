@@ -26,7 +26,7 @@ func TestClaudeIntegration(t *testing.T) {
 func TestClaudeFindPath(t *testing.T) {
 	c := &Claude{}
 
-	t.Run("finds claude in PATH", func(t *testing.T) {
+	t.Run("prefers free-code in PATH", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		name := "free-code"
 		if runtime.GOOS == "windows" {
@@ -45,10 +45,29 @@ func TestClaudeFindPath(t *testing.T) {
 		}
 	})
 
-	t.Run("falls back to ~/.claude/local/claude", func(t *testing.T) {
+	t.Run("falls back to claude in PATH", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		name := "claude"
+		if runtime.GOOS == "windows" {
+			name = "claude.exe"
+		}
+		fakeBin := filepath.Join(tmpDir, name)
+		os.WriteFile(fakeBin, []byte("#!/bin/sh\n"), 0o755)
+		t.Setenv("PATH", tmpDir)
+
+		got, err := c.findPath()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != fakeBin {
+			t.Errorf("findPath() = %q, want %q", got, fakeBin)
+		}
+	})
+
+	t.Run("falls back to ~/.claude/local/free-code", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		setTestHome(t, tmpDir)
-		t.Setenv("PATH", t.TempDir()) // empty dir, no claude binary
+		t.Setenv("PATH", t.TempDir()) // empty dir
 
 		name := "free-code"
 		if runtime.GOOS == "windows" {
@@ -67,10 +86,32 @@ func TestClaudeFindPath(t *testing.T) {
 		}
 	})
 
-	t.Run("returns error when neither PATH nor fallback exists", func(t *testing.T) {
+	t.Run("falls back to ~/.claude/local/claude", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		setTestHome(t, tmpDir)
-		t.Setenv("PATH", t.TempDir()) // empty dir, no claude binary
+		t.Setenv("PATH", t.TempDir()) // empty dir
+
+		name := "claude"
+		if runtime.GOOS == "windows" {
+			name = "claude.exe"
+		}
+		fallback := filepath.Join(tmpDir, ".claude", "local", name)
+		os.MkdirAll(filepath.Dir(fallback), 0o755)
+		os.WriteFile(fallback, []byte("#!/bin/sh\n"), 0o755)
+
+		got, err := c.findPath()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != fallback {
+			t.Errorf("findPath() = %q, want %q", got, fallback)
+		}
+	})
+
+	t.Run("returns error when nothing found", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		setTestHome(t, tmpDir)
+		t.Setenv("PATH", t.TempDir()) // empty dir
 
 		_, err := c.findPath()
 		if err == nil {

@@ -26,28 +26,32 @@ func (c *Claude) args(model string, extra []string) []string {
 }
 
 func (c *Claude) findPath() (string, error) {
-	if p, err := exec.LookPath("free-code"); err == nil {
-		return p, nil
+	// Prefer free-code, fall back to claude
+	for _, bin := range []string{"free-code", "claude"} {
+		if p, err := exec.LookPath(bin); err == nil {
+			return p, nil
+		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	name := "free-code"
-	if runtime.GOOS == "windows" {
-		name = "free-code.exe"
+	for _, name := range []string{"free-code", "claude"} {
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		fallback := filepath.Join(home, ".claude", "local", name)
+		if _, err := os.Stat(fallback); err == nil {
+			return fallback, nil
+		}
 	}
-	fallback := filepath.Join(home, ".claude", "local", name)
-	if _, err := os.Stat(fallback); err != nil {
-		return "", err
-	}
-	return fallback, nil
+	return "", fmt.Errorf("neither free-code nor claude found")
 }
 
 func (c *Claude) Run(model string, args []string) error {
 	claudePath, err := c.findPath()
 	if err != nil {
-		return fmt.Errorf("free-code is not installed, install from https://code.claude.com/docs/en/quickstart")
+		return fmt.Errorf("neither free-code nor claude is installed, install from https://code.claude.com/docs/en/quickstart")
 	}
 
 	cmd := exec.Command(claudePath, c.args(model, args)...)
