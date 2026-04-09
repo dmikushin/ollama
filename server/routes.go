@@ -221,6 +221,11 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		return
 	}
 
+	if modelRef.Source == modelSourceKilocode {
+		dispatchKilocodeGenerate(c, &req, modelRef.Base)
+		return
+	}
+
 	name := modelRef.Name
 
 	// We cannot currently consolidate this into GetModel because all we'll
@@ -934,6 +939,14 @@ func (s *Server) PullHandler(c *gin.Context) {
 		return
 	}
 
+	if modelRef.Source == modelSourceKilocode {
+		// KiloCode models are pure remote routes — there is nothing to download.
+		// Synthesize an immediate-success progress stream so `ollama run` and
+		// `ollama pull` complete without touching the local store.
+		stubKilocodePull(c, modelRef.Original)
+		return
+	}
+
 	name := modelRef.Name
 
 	name, err = getExistingName(name)
@@ -1133,6 +1146,11 @@ func (s *Server) ShowHandler(c *gin.Context) {
 	if modelRef.Source == modelSourceCloud {
 		req.Model = modelRef.Base
 		proxyCloudJSONRequest(c, req, cloudErrRemoteModelDetailsUnavailable)
+		return
+	}
+
+	if modelRef.Source == modelSourceKilocode {
+		c.JSON(http.StatusOK, kilocodeShowResponse(c.Request.Context(), modelRef.Base))
 		return
 	}
 
@@ -2118,6 +2136,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			return
 		}
 		proxyCloudJSONRequest(c, req, cloudErrRemoteInferenceUnavailable)
+		return
+	}
+
+	if modelRef.Source == modelSourceKilocode {
+		dispatchKilocodeChat(c, &req, modelRef.Base)
 		return
 	}
 
