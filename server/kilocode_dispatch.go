@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,15 +9,155 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/ollama/ollama/anthropic"
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/model/parsers"
 	"github.com/ollama/ollama/types/model"
 )
+
+// kilocodePassthroughMiddleware is the kilocode analog of
+// cloudPassthroughMiddleware. It runs BEFORE AnthropicMessagesMiddleware on
+// /v1/messages and, for :kilocode models, byte-proxies the original
+// Anthropic request straight to the KiloCode gateway. This avoids the lossy
+// round trip through api.ChatRequest (which would drop cache_control, beta
+// flags, full system content blocks, etc.) that dispatchKilocodeChat
+// otherwise performs for the native /api/chat endpoint.
+func kilocodePassthroughMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method != http.MethodPost {
+			c.Next()
+			return
+		}
+
+		// Decompress zstd bodies so we can inspect the model field.
+		if c.GetHeader("Content-Encoding") == "zstd" {
+			reader, err := zstd.NewReader(c.Request.Body, zstd.WithDecoderMaxMemory(8<<20))
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "failed to decompress request body"})
+				c.Abort()
+				return
+			}
+			defer reader.Close()
+			c.Request.Body = http.MaxBytesReader(c.Writer, io.NopCloser(reader), maxDecompressedBodySize)
+			c.Request.Header.Del("Content-Encoding")
+		}
+
+		body, err := readRequestBody(c.Request)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			c.Abort()
+			return
+		}
+
+		model, ok := extractModelField(body)
+		if !ok {
+			c.Next()
+			return
+		}
+		modelRef, err := parseAndValidateModelRef(model)
+		if err != nil || modelRef.Source != modelSourceKilocode {
+			c.Next()
+			return
+		}
+
+		// Strip the :kilocode suffix so the upstream sees a clean model id.
+		normalizedBody, err := replaceJSONModelField(body, modelRef.Base)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			c.Abort()
+			return
+		}
+
+		proxyKilocodeMessagesRequest(c, normalizedBody, modelRef.Base)
+		c.Abort()
+	}
+}
+
+// proxyKilocodeMessagesRequest forwards an already-decoded Anthropic
+// MessagesRequest body to the KiloCode gateway with bearer auth and
+// streams the response back through to the caller unchanged.
+func proxyKilocodeMessagesRequest(c *gin.Context, body []byte, baseModel string) {
+	client, err := anthropic.KiloCodeClientFromEnv()
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+
+	targetURL := strings.TrimRight(client.BaseURL, "/") + "/v1/messages"
+	outReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Copy headers from the incoming request, excluding hop-by-hop and
+	// auth headers that would conflict with the bearer token we set.
+	for key, values := range c.Request.Header {
+		k := strings.ToLower(key)
+		if k == "authorization" || k == "x-api-key" || k == "host" || k == "content-length" || k == "content-encoding" {
+			continue
+		}
+		for _, v := range values {
+			outReq.Header.Add(key, v)
+		}
+	}
+	outReq.Header.Set("Authorization", "Bearer "+client.APIKey)
+	if outReq.Header.Get("anthropic-version") == "" {
+		outReq.Header.Set("anthropic-version", "2023-06-01")
+	}
+	outReq.Header.Set("Content-Type", "application/json")
+
+	httpClient := client.HTTPClient
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	resp, err := httpClient.Do(outReq)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("kilocode request: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+	// Forward response headers (minus hop-by-hop) and status code.
+	for key, values := range resp.Header {
+		k := strings.ToLower(key)
+		if k == "content-length" || k == "transfer-encoding" || k == "connection" {
+			continue
+		}
+		for _, v := range values {
+			c.Writer.Header().Add(key, v)
+		}
+	}
+	c.Status(resp.StatusCode)
+
+	// Stream body bytes through with periodic flushing so SSE clients
+	// receive incremental events as they arrive.
+	flusher, canFlush := c.Writer.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := c.Writer.Write(buf[:n]); werr != nil {
+				return
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+		if rerr != nil {
+			if rerr != io.EOF {
+				slog.Debug("kilocode passthrough read", "error", rerr)
+			}
+			return
+		}
+	}
+}
 
 // dispatchKilocodeChat handles an api.ChatRequest whose model resolved to
 // modelSourceKilocode. It translates the request into Anthropic Messages
