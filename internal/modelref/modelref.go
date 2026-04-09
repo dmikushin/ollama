@@ -12,10 +12,15 @@ const (
 	ModelSourceUnspecified ModelSource = iota
 	ModelSourceLocal
 	ModelSourceCloud
+	// ModelSourceKilocode routes inference through the KiloCode Gateway,
+	// which exposes an Anthropic-compatible /v1/messages endpoint. Ollama
+	// acts as a protocol translator between its native /api/chat API and
+	// the Anthropic Messages API.
+	ModelSourceKilocode
 )
 
 var (
-	ErrConflictingSourceSuffix = errors.New("use either :local or :cloud, not both")
+	ErrConflictingSourceSuffix = errors.New("use only one of :local, :cloud, or :kilocode")
 	ErrModelRequired           = errors.New("model is required")
 )
 
@@ -104,6 +109,8 @@ func parseSourceSuffix(raw string) (string, ModelSource, bool) {
 			return raw[:idx], ModelSourceCloud, true
 		case "local":
 			return raw[:idx], ModelSourceLocal, true
+		case "kilocode":
+			return raw[:idx], ModelSourceKilocode, true
 		}
 
 		if !strings.Contains(suffixRaw, "/") && strings.HasSuffix(suffix, "-cloud") {

@@ -11,6 +11,7 @@ const (
 	modelSourceUnspecified modelSource = modelref.ModelSourceUnspecified
 	modelSourceLocal       modelSource = modelref.ModelSourceLocal
 	modelSourceCloud       modelSource = modelref.ModelSourceCloud
+	modelSourceKilocode    modelSource = modelref.ModelSourceKilocode
 )
 
 var (
