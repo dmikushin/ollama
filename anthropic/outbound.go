@@ -70,7 +70,17 @@ func ToMessagesRequest(r *api.ChatRequest) (*MessagesRequest, error) {
 	}
 
 	if r.Think != nil && r.Think.Bool() {
-		out.Thinking = &ThinkingConfig{Type: "enabled"}
+		// Anthropic rejects a ThinkingConfig with type=enabled unless
+		// budget_tokens is also set (must be >= 1024 and < max_tokens).
+		// Default to half of max_tokens, floored at 1024.
+		budget := out.MaxTokens / 2
+		if budget < 1024 {
+			budget = 1024
+		}
+		if budget >= out.MaxTokens {
+			budget = out.MaxTokens - 1
+		}
+		out.Thinking = &ThinkingConfig{Type: "enabled", BudgetTokens: budget}
 	}
 
 	// Convert tools. Ollama's api.Tool wraps a function definition with a

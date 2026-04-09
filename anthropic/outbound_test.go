@@ -150,6 +150,12 @@ func TestToMessagesRequest_ThinkingEnabled(t *testing.T) {
 	if out.Thinking == nil || out.Thinking.Type != "enabled" {
 		t.Errorf("thinking config: %+v", out.Thinking)
 	}
+	if out.Thinking.BudgetTokens < 1024 {
+		t.Errorf("budget_tokens must be >= 1024, got %d", out.Thinking.BudgetTokens)
+	}
+	if out.Thinking.BudgetTokens >= out.MaxTokens {
+		t.Errorf("budget_tokens %d must be < max_tokens %d", out.Thinking.BudgetTokens, out.MaxTokens)
+	}
 }
 
 func TestToMessagesRequest_ToolsConverted(t *testing.T) {
