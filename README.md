@@ -98,10 +98,22 @@ and the streaming responses are converted back to native Ollama JSON chunks.
 Use `:kilocode` to route through the [KiloCode Gateway](https://kilocode.ai/), which provides access to
 OpenRouter models via an Anthropic-compatible endpoint.
 
-**Setup:** Set the `KILOCODE_API_KEY` environment variable or create `~/.kilocode/key` with your API key.
+**Setup:** Set the `KILOCODE_API_KEY` environment variable, or create `~/.kilocode/key` with your API key.
+When running Ollama as a **systemd service**, place the key at `/usr/share/ollama/.kilocode/key` (owned by
+the `ollama` user):
 
 ```shell
+# Interactive / CLI usage
 export KILOCODE_API_KEY="your-kilocode-api-key"
+
+# Or file-based (interactive session)
+mkdir -p ~/.kilocode && echo "sk-or-..." > ~/.kilocode/key
+
+# Or file-based (systemd service)
+sudo mkdir -p /usr/share/ollama/.kilocode
+sudo cp ~/.kilocode/key /usr/share/ollama/.kilocode/key
+sudo chown ollama:ollama /usr/share/ollama/.kilocode/key
+sudo chmod 600 /usr/share/ollama/.kilocode/key
 ```
 
 ```shell
@@ -124,17 +136,29 @@ curl -X POST http://localhost:11434/api/chat -d '{
 Use `:openrouter` to route directly through [OpenRouter's](https://openrouter.ai/) OpenAI-compatible API
 at `https://openrouter.ai/api/v1`.
 
-**Setup:** Set the `OPENROUTER_API_KEY` environment variable.
+**Setup:** Set the `OPENROUTER_API_KEY` environment variable, or create `~/.openrouter/key` with your API key.
+When running Ollama as a **systemd service**, place the key at `/usr/share/ollama/.openrouter/key` (owned by
+the `ollama` user):
 
 ```shell
+# Interactive / CLI usage
 export OPENROUTER_API_KEY="sk-or-..."
+
+# Or file-based (interactive session)
+mkdir -p ~/.openrouter && echo "sk-or-..." > ~/.openrouter/key
+
+# Or file-based (systemd service)
+sudo mkdir -p /usr/share/ollama/.openrouter
+sudo cp ~/.openrouter/key /usr/share/ollama/.openrouter/key
+sudo chown ollama:ollama /usr/share/ollama/.openrouter/key
+sudo chmod 600 /usr/share/ollama/.openrouter/key
 ```
 
 ```shell
-# Use OpenRouter's free tier (routes among available free models)
+# Use OpenRouter's free tier
 ollama run openrouter/free:openrouter "Hello!"
 
-# Use a specific free model with the :free suffix
+# Use a specific free model
 ollama run google/gemma-3-12b-it:free:openrouter "What is 2+2?"
 
 # Via the REST API

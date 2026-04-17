@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/ollama/ollama/api"
@@ -18,6 +19,7 @@ import (
 const (
 	defaultBaseURL = "https://openrouter.ai/api/v1"
 	keyEnv         = "OPENROUTER_API_KEY"
+	keyFile        = ".openrouter/key"
 )
 
 // Client is an HTTP client for OpenRouter's OpenAI-compatible API.
@@ -27,12 +29,13 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
-// NewClient constructs a Client, loading the API key from the OPENROUTER_API_KEY
-// environment variable. Returns an error if the key is not set.
+// NewClient constructs a Client, loading the API key from OPENROUTER_API_KEY
+// environment variable or ~/.openrouter/key. Returns an error if no key
+// source is available.
 func NewClient() (*Client, error) {
-	key := strings.TrimSpace(os.Getenv(keyEnv))
-	if key == "" {
-		return nil, fmt.Errorf("no OpenRouter API key: set %s", keyEnv)
+	key, err := loadKey()
+	if err != nil {
+		return nil, err
 	}
 	return &Client{
 		BaseURL: defaultBaseURL,
@@ -41,8 +44,9 @@ func NewClient() (*Client, error) {
 	}, nil
 }
 
-// ClientFromEnv is equivalent to NewClient but accepts an optional base URL override
-// via the OLLAMA_OPENROUTER_BASE_URL environment variable for testing.
+// ClientFromEnv is a convenience alias for NewClient that also accepts an
+// optional base URL override via the OLLAMA_OPENROUTER_BASE_URL environment
+// variable for testing/mocking.
 func ClientFromEnv() (*Client, error) {
 	c, err := NewClient()
 	if err != nil {
@@ -52,6 +56,33 @@ func ClientFromEnv() (*Client, error) {
 		c.BaseURL = override
 	}
 	return c, nil
+}
+
+// loadKey reads the OpenRouter API key, trying env first then file.
+func loadKey() (string, error) {
+	// Priority 1: Environment variable OPENROUTER_API_KEY
+	if key := strings.TrimSpace(os.Getenv(keyEnv)); key != "" {
+		return key, nil
+	}
+
+	// Priority 2: File ~/.openrouter/key
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("locate home dir: %w", err)
+	}
+	path := filepath.Join(home, keyFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("no OpenRouter API key: set %s or create %s", keyEnv, path)
+		}
+		return "", fmt.Errorf("read %s: %w", path, err)
+	}
+	key := strings.TrimSpace(string(data))
+	if key == "" {
+		return "", fmt.Errorf("%s is empty", path)
+	}
+	return key, nil
 }
 
 // Chat sends a ChatCompletionRequest to OpenRouter and returns the HTTP response.
