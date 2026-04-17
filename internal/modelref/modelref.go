@@ -17,10 +17,15 @@ const (
 	// acts as a protocol translator between its native /api/chat API and
 	// the Anthropic Messages API.
 	ModelSourceKilocode
+	// ModelSourceOpenRouter routes inference through OpenRouter's
+	// OpenAI-compatible API at https://openrouter.ai/api/v1. Ollama
+	// translates its native /api/chat requests to OpenAI ChatCompletion
+	// format and streams the SSE response back into Ollama chunks.
+	ModelSourceOpenRouter
 )
 
 var (
-	ErrConflictingSourceSuffix = errors.New("use only one of :local, :cloud, or :kilocode")
+	ErrConflictingSourceSuffix = errors.New("use only one of :local, :cloud, :kilocode, or :openrouter")
 	ErrModelRequired           = errors.New("model is required")
 )
 
@@ -111,6 +116,8 @@ func parseSourceSuffix(raw string) (string, ModelSource, bool) {
 			return raw[:idx], ModelSourceLocal, true
 		case "kilocode":
 			return raw[:idx], ModelSourceKilocode, true
+		case "openrouter":
+			return raw[:idx], ModelSourceOpenRouter, true
 		}
 
 		if !strings.Contains(suffixRaw, "/") && strings.HasSuffix(suffix, "-cloud") {

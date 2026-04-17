@@ -12,6 +12,7 @@ const (
 	modelSourceLocal       modelSource = modelref.ModelSourceLocal
 	modelSourceCloud       modelSource = modelref.ModelSourceCloud
 	modelSourceKilocode    modelSource = modelref.ModelSourceKilocode
+	modelSourceOpenRouter   modelSource = modelref.ModelSourceOpenRouter
 )
 
 var (

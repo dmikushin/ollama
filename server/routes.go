@@ -226,6 +226,11 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		return
 	}
 
+	if modelRef.Source == modelSourceOpenRouter {
+		dispatchOpenRouterGenerate(c, &req, modelRef.Base)
+		return
+	}
+
 	name := modelRef.Name
 
 	// We cannot currently consolidate this into GetModel because all we'll
@@ -947,6 +952,12 @@ func (s *Server) PullHandler(c *gin.Context) {
 		return
 	}
 
+	if modelRef.Source == modelSourceOpenRouter {
+		// OpenRouter models are pure remote routes — nothing to download.
+		stubOpenRouterPull(c, modelRef.Original)
+		return
+	}
+
 	name := modelRef.Name
 
 	name, err = getExistingName(name)
@@ -1151,6 +1162,11 @@ func (s *Server) ShowHandler(c *gin.Context) {
 
 	if modelRef.Source == modelSourceKilocode {
 		c.JSON(http.StatusOK, kilocodeShowResponse(c.Request.Context(), modelRef.Base))
+		return
+	}
+
+	if modelRef.Source == modelSourceOpenRouter {
+		c.JSON(http.StatusOK, openRouterShowResponse(c.Request.Context(), modelRef.Base))
 		return
 	}
 
@@ -2141,6 +2157,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 	if modelRef.Source == modelSourceKilocode {
 		dispatchKilocodeChat(c, &req, modelRef.Base)
+		return
+	}
+
+	if modelRef.Source == modelSourceOpenRouter {
+		dispatchOpenRouterChat(c, &req, modelRef.Base)
 		return
 	}
 

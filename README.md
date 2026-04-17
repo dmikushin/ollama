@@ -87,6 +87,73 @@ See [ollama.com/library](https://ollama.com/library) for the full list.
 
 See the [quickstart guide](https://docs.ollama.com/quickstart) for more details.
 
+## Cloud Model Providers
+
+Ollama can route inference through external cloud providers using model suffixes (`:kilocode`, `:openrouter`).
+This acts as a protocol translator — Ollama's `/api/chat` requests are converted to Anthropic or OpenAI format,
+and the streaming responses are converted back to native Ollama JSON chunks.
+
+### KiloCode Gateway
+
+Use `:kilocode` to route through the [KiloCode Gateway](https://kilocode.ai/), which provides access to
+OpenRouter models via an Anthropic-compatible endpoint.
+
+**Setup:** Set the `KILOCODE_API_KEY` environment variable or create `~/.kilocode/key` with your API key.
+
+```shell
+export KILOCODE_API_KEY="your-kilocode-api-key"
+```
+
+```shell
+# Chat with any KiloCode/OpenRouter model
+ollama run kilo-auto/free:kilocode "Hello!"
+
+# Use a specific model (e.g. Claude)
+ollama run anthropic/claude-3.5-sonnet:kilocode "What is Ollama?"
+
+# Via the REST API
+curl -X POST http://localhost:11434/api/chat -d '{
+  "model": "kilo-auto/free:kilocode",
+  "messages": [{"role": "user", "content": "Say hello in three words"}],
+  "stream": true
+}'
+```
+
+### OpenRouter
+
+Use `:openrouter` to route directly through [OpenRouter's](https://openrouter.ai/) OpenAI-compatible API
+at `https://openrouter.ai/api/v1`.
+
+**Setup:** Set the `OPENROUTER_API_KEY` environment variable.
+
+```shell
+export OPENROUTER_API_KEY="sk-or-..."
+```
+
+```shell
+# Use OpenRouter's free tier (routes among available free models)
+ollama run openrouter/free:openrouter "Hello!"
+
+# Use a specific free model with the :free suffix
+ollama run google/gemma-3-12b-it:free:openrouter "What is 2+2?"
+
+# Via the REST API
+curl -X POST http://localhost:11434/api/chat -d '{
+  "model": "openrouter/free:openrouter",
+  "messages": [{"role": "user", "content": "Why is the sky blue?"}],
+  "stream": true
+}'
+
+# Show model metadata
+ollama show openrouter/free:openrouter
+
+# Pull is a no-op (pure remote model)
+ollama pull openrouter/free:openrouter
+```
+
+All cloud models support reasoning toggle, temperature control, stop sequences, tool calling, and streaming —
+just like local models.
+
 ## REST API
 
 Ollama has a REST API for running and managing models.
