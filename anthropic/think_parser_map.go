@@ -33,15 +33,15 @@ func ThinkParserName(modelID string) string {
 		return "deepseek3"
 	}
 
-	// Qwen3 thinking variants — use <think> markers identically to deepseek3.
-	// Qwen3 VL thinking has its own parser variant.
+	// Qwen3 / Qwen3.5 thinking variants.
+	// qwen3.6-plus is a reasoning model that emits <think> tags despite not
+	// having "thinking" in its name — it needs the qwen3-thinking parser.
 	if strings.HasPrefix(id, "qwen/qwen3-vl-") && strings.Contains(id, "thinking") {
 		return "qwen3-vl-thinking"
 	}
 	if strings.HasPrefix(id, "qwen/") && strings.Contains(id, "thinking") {
 		return "qwen3-thinking"
 	}
-
 	// Allen AI Olmo 3 think variants.
 	if strings.HasPrefix(id, "allenai/olmo-3-") && strings.Contains(id, "think") {
 		return "olmo3-think"

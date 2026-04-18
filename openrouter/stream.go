@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/model/parsers"
 	"github.com/ollama/ollama/openai"
 )
 
@@ -17,12 +18,36 @@ import (
 type StreamConverter struct {
 	Model    string
 	OnChunk  func(chunk api.ChatResponse) error
+	// TextParser, when non-nil, feeds content through a model-specific
+	// parser (e.g. for <think> tag splitting). Used for reasoning models
+	// that emit raw tags rather than structured delta.Reasoning.
+	TextParser parsers.Parser
+
 	// State tracking for usage and final done
 	doneReason       string
 	promptTokens     int
 	completionTokens int
 	totalTokens      int
 	hasEmittedDone   bool
+	// Set to true once we see structured delta.Reasoning from the API.
+	// When true, TextParser is bypassed for content because OpenRouter
+	// already split thinking from content (no raw <think> tags).
+	hasStructuredReasoning bool
+	// Set to true once real content has been emitted during streaming.
+	hasEmittedContent bool
+	// Accumulated thinking text, used to populate content in the done
+	// chunk for models that only emit reasoning and never send delta.Content.
+	thinkingAccum strings.Builder
+	// Pending tool calls accumulated from incremental deltas.
+	// OpenAI SSE sends tool calls as: first delta has ID+name,
+	// subsequent deltas append to arguments.  Keyed by delta index.
+	pendingToolCalls map[int]*pendingToolCall
+}
+
+type pendingToolCall struct {
+	ID   string
+	Name string
+	Args strings.Builder
 }
 
 // NewStreamConverter creates a converter that will call onChunk for each
@@ -62,7 +87,6 @@ func (sc *StreamConverter) Run(reader io.Reader) error {
 				if err := sc.emitDone(); err != nil {
 					return err
 				}
-				sc.hasEmittedDone = true
 				return nil
 			}
 			eventBuf.WriteString(data)
@@ -145,40 +169,128 @@ func (sc *StreamConverter) processEvent(dataStr string) error {
 	choice := chunk.Choices[0]
 	delta := choice.Delta
 
+	// Handle thinking/reasoning via structured delta first (priority).
+	// OpenRouter models like qwen3.6-plus put the ENTIRE answer in
+	// delta.Reasoning with no delta.Content.  Emit as Content so
+	// downstream Anthropic SSE produces text_delta (visible response)
+	// instead of thinking_delta (hidden reasoning panel).
+	if delta.Reasoning != "" {
+		sc.hasStructuredReasoning = true
+		sc.thinkingAccum.WriteString(delta.Reasoning)
+		sc.hasEmittedContent = true
+		if err := sc.OnChunk(api.ChatResponse{
+			Model:     sc.Model,
+			CreatedAt: time.Unix(chunk.Created, 0).UTC(),
+			Message: api.Message{
+				Role:    "assistant",
+				Content: delta.Reasoning,
+			},
+		}); err != nil {
+			return err
+		}
+	}
+
 	contentStr := contentToString(delta.Content)
 
-	resp := api.ChatResponse{
-		Model:     sc.Model,
-		CreatedAt: time.Unix(chunk.Created, 0).UTC(),
-		Message: api.Message{
-			Role:    "assistant",
-			Content: contentStr,
-		},
+	// If a TextParser is configured AND the stream does NOT use structured
+	// reasoning, route content through the parser for <think> tag splitting.
+	// When OpenRouter already provides structured delta.Reasoning, the
+	// content arrives clean — bypass the parser which would buffer forever
+	// waiting for </think> tags that will never come.
+	if sc.TextParser != nil && contentStr != "" && !sc.hasStructuredReasoning {
+		if err := sc.emitThroughParser(contentStr, false); err != nil {
+			return err
+		}
+		sc.hasEmittedContent = true
+	} else if contentStr != "" {
+		sc.hasEmittedContent = true
+		if err := sc.OnChunk(api.ChatResponse{
+			Model:     sc.Model,
+			CreatedAt: time.Unix(chunk.Created, 0).UTC(),
+			Message: api.Message{
+				Role:    "assistant",
+				Content: contentStr,
+			},
+		}); err != nil {
+			return err
+		}
 	}
 
-	// Handle thinking/reasoning content
-	if delta.Reasoning != "" {
-		resp.Message.Thinking = delta.Reasoning
-	}
-
-	// Handle tool calls
+	// Accumulate tool call deltas (OpenAI streams them incrementally:
+	// first chunk has ID+name, subsequent chunks append arguments).
 	if len(delta.ToolCalls) > 0 {
-		resp.Message.ToolCalls = toOllamaToolCalls(delta.ToolCalls)
+		if sc.pendingToolCalls == nil {
+			sc.pendingToolCalls = make(map[int]*pendingToolCall)
+		}
+		for _, tc := range delta.ToolCalls {
+			idx := tc.Index
+			ptc, ok := sc.pendingToolCalls[idx]
+			if !ok {
+				ptc = &pendingToolCall{}
+				sc.pendingToolCalls[idx] = ptc
+			}
+			if tc.ID != "" {
+				ptc.ID = tc.ID
+			}
+			if tc.Function.Name != "" {
+				ptc.Name = tc.Function.Name
+			}
+			if tc.Function.Arguments != "" {
+				ptc.Args.WriteString(tc.Function.Arguments)
+			}
+		}
 	}
 
 	// Handle finish reason
 	if choice.FinishReason != nil {
 		sc.doneReason = *choice.FinishReason
-		resp.Done = true
-		resp.DoneReason = sc.doneReason
-		resp.Metrics.PromptEvalCount = sc.promptTokens
-		resp.Metrics.EvalCount = sc.completionTokens
+		// Usage metrics (from stream_options) arrive in a separate usage-only
+		// chunk AFTER the finish_reason chunk.  Defer emitting the done
+		// chunk to the next Run iteration or the [DONE] sentinel so that
+		// metrics are captured.
+		return nil
 	}
 
-	return sc.OnChunk(resp)
+	return nil
 }
 
 func (sc *StreamConverter) emitDone() error {
+	if sc.hasEmittedDone {
+		return nil
+	}
+	sc.hasEmittedDone = true
+	// Drain any pending content from the parser before emitting done.
+	if sc.TextParser != nil {
+		if err := sc.emitThroughParser("", true); err != nil {
+			return err
+		}
+	}
+	// Emit accumulated tool calls as a single chunk with complete arguments.
+	if len(sc.pendingToolCalls) > 0 {
+		tcs := make([]api.ToolCall, 0, len(sc.pendingToolCalls))
+		for _, ptc := range sc.pendingToolCalls {
+			tc := api.ToolCall{
+				ID: ptc.ID,
+				Function: api.ToolCallFunction{
+					Name: ptc.Name,
+				},
+			}
+			if args := ptc.Args.String(); args != "" {
+				json.Unmarshal([]byte(args), &tc.Function.Arguments)
+			}
+			tcs = append(tcs, tc)
+		}
+		if err := sc.OnChunk(api.ChatResponse{
+			Model:     sc.Model,
+			CreatedAt: time.Now().UTC(),
+			Message: api.Message{
+				Role:      "assistant",
+				ToolCalls: tcs,
+			},
+		}); err != nil {
+			return err
+		}
+	}
 	resp := api.ChatResponse{
 		Model:      sc.Model,
 		CreatedAt:  time.Now().UTC(),
@@ -189,9 +301,78 @@ func (sc *StreamConverter) emitDone() error {
 	if resp.DoneReason == "" {
 		resp.DoneReason = "stop"
 	}
+	// If the model never emitted visible content (only reasoning/thinking),
+	// use the accumulated thinking as content so downstream consumers see
+	// the answer.
+	if !sc.hasEmittedContent {
+		if allThinking := sc.thinkingAccum.String(); allThinking != "" {
+			resp.Message.Content = allThinking
+		}
+	}
 	resp.Metrics.PromptEvalCount = sc.promptTokens
 	resp.Metrics.EvalCount = sc.completionTokens
 	return sc.OnChunk(resp)
+}
+
+// emitThroughParser pipes content through the TextParser before emitting.
+// When no parser is configured it emits content verbatim. When a parser is
+// configured, it splits into thinking, content, and tool calls.
+func (sc *StreamConverter) emitThroughParser(text string, done bool) error {
+	if sc.TextParser == nil {
+		if text == "" {
+			return nil
+		}
+		return sc.OnChunk(api.ChatResponse{
+			Model:     sc.Model,
+			CreatedAt: time.Now().UTC(),
+			Message: api.Message{
+				Role:    "assistant",
+				Content: text,
+			},
+		})
+	}
+
+	content, thinking, calls, err := sc.TextParser.Add(text, done)
+	if err != nil {
+		return fmt.Errorf("text parser: %w", err)
+	}
+	if thinking != "" {
+		if err := sc.OnChunk(api.ChatResponse{
+			Model:     sc.Model,
+			CreatedAt: time.Now().UTC(),
+			Message: api.Message{
+				Role:     "assistant",
+				Thinking: thinking,
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	if content != "" {
+		if err := sc.OnChunk(api.ChatResponse{
+			Model:     sc.Model,
+			CreatedAt: time.Now().UTC(),
+			Message: api.Message{
+				Role:    "assistant",
+				Content: content,
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	if len(calls) > 0 {
+		if err := sc.OnChunk(api.ChatResponse{
+			Model:     sc.Model,
+			CreatedAt: time.Now().UTC(),
+			Message: api.Message{
+				Role:      "assistant",
+				ToolCalls: calls,
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // NonStreamingResponse converts a non-streaming ChatCompletion to a single
@@ -275,10 +456,27 @@ func toStringSlice(v any) []string {
 func ConvertChatToOllamaRequest(req *api.ChatRequest) *openai.ChatCompletionRequest {
 	messages := make([]openai.Message, len(req.Messages))
 	for i, msg := range req.Messages {
-		messages[i] = openai.Message{
-			Role:    msg.Role,
-			Content: msg.Content,
+		m := openai.Message{
+			Role:       msg.Role,
+			Content:    msg.Content,
+			Reasoning:  msg.Thinking,
+			ToolCallID: msg.ToolCallID,
 		}
+		for _, tc := range msg.ToolCalls {
+			args, _ := json.Marshal(tc.Function.Arguments)
+			m.ToolCalls = append(m.ToolCalls, openai.ToolCall{
+				ID:   tc.ID,
+				Type: "function",
+				Function: struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				}{
+					Name:      tc.Function.Name,
+					Arguments: string(args),
+				},
+			})
+		}
+		messages[i] = m
 	}
 
 	streaming := req.Stream == nil || *req.Stream

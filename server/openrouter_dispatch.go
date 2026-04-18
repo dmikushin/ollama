@@ -12,7 +12,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/ollama/ollama/anthropic"
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/model/parsers"
 	"github.com/ollama/ollama/openrouter"
 	"github.com/ollama/ollama/openai"
 	"github.com/ollama/ollama/types/model"
@@ -68,8 +70,6 @@ func dispatchOpenRouterChat(c *gin.Context, req *api.ChatRequest, baseModel stri
 // dispatchOpenRouterStreaming reads an OpenAI SSE stream and emits Ollama
 // ndjson chunks.
 func dispatchOpenRouterStreaming(c *gin.Context, body io.Reader, origModel, baseModel string) {
-	_ = baseModel // reserved for parser hookup if needed later
-
 	conv := openrouter.NewStreamConverter(origModel, func(chunk api.ChatResponse) error {
 		chunk.Model = origModel
 		chunk.RemoteModel = origModel
@@ -84,6 +84,7 @@ func dispatchOpenRouterStreaming(c *gin.Context, body io.Reader, origModel, base
 		c.Writer.Flush()
 		return nil
 	})
+	conv.TextParser = openRouterTextParser(baseModel)
 
 	if err := conv.Run(body); err != nil {
 		slog.Error("openrouter stream converter failed", "error", err)
@@ -234,6 +235,22 @@ func writeOpenRouterError(c *gin.Context, err error) {
 		return
 	}
 	c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+}
+
+// openRouterTextParser looks up a <think>-aware parser for the given model id
+// and initializes it. Returns nil for models whose text stream does not need
+// tag splitting. This mirrors kilocodeTextParser in kilocode_dispatch.go.
+func openRouterTextParser(modelID string) parsers.Parser {
+	name := anthropic.ThinkParserName(modelID)
+	if name == "" {
+		return nil
+	}
+	p := parsers.ParserForName(name)
+	if p == nil {
+		return nil
+	}
+	_ = p.Init(nil, nil, nil)
+	return p
 }
 
 // openRouterShowResponse synthesizes an api.ShowResponse for an OpenRouter
